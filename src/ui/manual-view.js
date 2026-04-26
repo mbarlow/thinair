@@ -3,7 +3,7 @@
 import { el, clear, fmtBytes, copyText, toast, logger } from "./util.js";
 import { createPeer, createOffer, createAnswer, applyAnswer, watchConnection } from "../webrtc/peer.js";
 import { sendFile, receiveFile, downloadBlob } from "../webrtc/file-transfer.js";
-import { makeOfferEnvelope, makeAnswerEnvelope, envelopeToString, parsePayload, newSessionId } from "../webrtc/signaling.js";
+import { makeOfferBytes, makeAnswerBytes, bytesToText, parsePayloadFromText, newSessionId } from "../webrtc/signaling.js";
 
 export function renderManual(root) {
   clear(root);
@@ -94,15 +94,15 @@ function renderManualSend(host) {
     });
     stateBig.textContent = "Building offer";
     const desc = await createOffer(pc);
-    const env = makeOfferEnvelope(desc.sdp, session);
-    offerArea.value = envelopeToString(env);
+    const offerBytes = makeOfferBytes(desc.sdp, session);
+    offerArea.value = "thinair:" + bytesToText(offerBytes);
     stateBig.textContent = "Waiting for answer";
   });
 
   applyBtn.addEventListener("click", async () => {
     if (!pc) { logFn("No peer yet — pick a file first"); return; }
     try {
-      const ans = parsePayload(answerArea.value);
+      const ans = parsePayloadFromText(answerArea.value);
       if (ans.type !== "answer") throw new Error("not an answer");
       stateBig.textContent = "Applying answer";
       await applyAnswer(pc, { type: "answer", sdp: ans.sdp });
@@ -148,7 +148,7 @@ function renderManualReceive(host) {
 
   buildBtn.addEventListener("click", async () => {
     try {
-      const off = parsePayload(offerArea.value);
+      const off = parsePayloadFromText(offerArea.value);
       if (off.type !== "offer") throw new Error("not an offer");
       if (pc) try { pc.close(); } catch {}
       pc = createPeer();
@@ -173,8 +173,8 @@ function renderManualReceive(host) {
       watchConnection(pc, (s) => logFn(`pc: ${s.connection} / ${s.ice}`));
       stateBig.textContent = "Building answer";
       const desc = await createAnswer(pc, { type: "offer", sdp: off.sdp });
-      const env = makeAnswerEnvelope(desc.sdp, off.id || "thinair");
-      answerArea.value = envelopeToString(env);
+      const ansBytes = makeAnswerBytes(desc.sdp, off.id || "thinair");
+      answerArea.value = "thinair:" + bytesToText(ansBytes);
       stateBig.textContent = "Send this answer back";
     } catch (e) {
       stateBig.textContent = "Bad offer: " + e.message;

@@ -1,16 +1,18 @@
 // Reusable widgets that present an offer/answer payload via QR / audio chirp / text,
 // and accept an offer/answer via QR scan / chirp listen / text paste.
+//
+// Payload model: a Uint8Array from sdp-pack. QR/text encodes as base64url
+// (with thinair: or #thinair= prefix). Audio sends the raw bytes through FSK.
 
 import { el, clear, copyText, toast } from "./util.js";
 import { AnimatedQR } from "../qr/qr-generate.js";
 import { QRScanner } from "../qr/qr-scan.js";
 import { ChirpPlayer, buildChirpForPayload } from "../audio/chirp-encode.js";
 import { ChirpDecoder } from "../audio/chirp-decode.js";
-import { strToBytes, bytesToStr } from "../codec/base.js";
+import { bytesToText, parsePayloadFromText, parsePayloadFromBytes } from "../webrtc/signaling.js";
 
-// PRESENT widget: shows a payload via QR + offers Audio + Copy actions.
-// Returns { node, dispose }.
-export function presentPayload(payloadText, opts = {}) {
+// PRESENT widget. payloadBytes is a Uint8Array.
+export function presentPayload(payloadBytes, opts = {}) {
   const wrap = el("div", { class: "col" });
 
   const tabs = el("div", { class: "subtabs" },
@@ -24,6 +26,9 @@ export function presentPayload(payloadText, opts = {}) {
   let chirpPlayer = null;
   let audioCtx = null;
   let chirpStatus = null;
+
+  const textForQR = "thinair:" + bytesToText(payloadBytes);
+  const urlForQR = (opts.urlPrefix || (location.href.split("#")[0])) + "#thinair=" + bytesToText(payloadBytes);
 
   function setMode(m) {
     mode = m;
@@ -43,14 +48,12 @@ export function presentPayload(payloadText, opts = {}) {
     const stat = el("div", { class: "kv center", style: { marginTop: "8px" } }, "");
     body.appendChild(qrBox);
     body.appendChild(stat);
-    const url = (opts.urlPrefix || (location.href.split("#")[0])) + "#thinair=" + payloadText;
-    const usePayloadOnly = opts.urlPrefix === false;
-    const finalText = usePayloadOnly ? ("thinair:" + payloadText) : url;
+    const finalText = (opts.urlPrefix === false) ? textForQR : urlForQR;
     animQR = new AnimatedQR(qrBox, finalText, { intervalMs: 350 });
     animQR.start().then(() => {
       const frames = animQR.frames.length;
       stat.textContent = frames === 1
-        ? `Single QR · ${finalText.length} chars`
+        ? `Single QR · ${finalText.length} chars · ${payloadBytes.length} packed bytes`
         : `Animated QR · ${frames} frames · ${finalText.length} chars`;
     }).catch((e) => {
       stat.textContent = "QR error: " + e.message + ". Use Text fallback.";
@@ -64,7 +67,7 @@ export function presentPayload(payloadText, opts = {}) {
       el("option", { value: "modem-v1" }, "modem"),
       el("option", { value: "diagnostic-v1" }, "diagnostic (slow)"),
     );
-    const repeatInput = el("input", { type: "number", value: 4, min: 1, max: 20, style: { width: "80px" } });
+    const repeatInput = el("input", { type: "number", value: 6, min: 1, max: 30, style: { width: "80px" } });
     const playBtn = el("button", { class: "primary" }, "Play chirp");
     const stopBtn = el("button", {}, "Stop");
     const lengthRow = el("div", { class: "kv" }, "");
@@ -80,20 +83,19 @@ export function presentPayload(payloadText, opts = {}) {
     body.appendChild(cycleRow);
     body.appendChild(chirpStatus);
     body.appendChild(el("p", { class: "hint", style: { marginTop: "8px" } },
-      "Hold the device speaker near the other device's microphone. Audio cannot reliably carry full WebRTC offers — for large payloads use QR or Text."
+      `Sending ${payloadBytes.length} packed bytes. Hold the device speaker near the other device's microphone.`
     ));
 
     playBtn.addEventListener("click", async () => {
       try {
         if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         if (audioCtx.state === "suspended") await audioCtx.resume();
-        const bytes = strToBytes(payloadText);
-        if (bytes.length > 8192) {
-          chirpStatus.textContent = "Payload too large for chirp: " + bytes.length + " bytes. Use QR.";
+        if (payloadBytes.length > 8192) {
+          chirpStatus.textContent = "Payload too large for chirp: " + payloadBytes.length + " bytes. Use QR.";
           return;
         }
-        const built = buildChirpForPayload(audioCtx, bytes, sessionId, profileSel.value);
-        lengthRow.textContent = `Frames: ${built.frames.length} · ${(built.buffer.duration).toFixed(1)}s per cycle · ${bytes.length} bytes`;
+        const built = buildChirpForPayload(audioCtx, payloadBytes, sessionId, profileSel.value);
+        lengthRow.textContent = `Frames: ${built.frames.length} · ${(built.buffer.duration).toFixed(1)}s per cycle · ${payloadBytes.length} bytes`;
         chirpPlayer = new ChirpPlayer(audioCtx);
         chirpPlayer.play(built.buffer, parseInt(repeatInput.value, 10) || 3,
           (n, max) => { cycleRow.textContent = `Cycle ${n}/${max}`; },
@@ -111,13 +113,13 @@ export function presentPayload(payloadText, opts = {}) {
 
   function renderTextMode() {
     const ta = el("textarea", { readonly: true, rows: 8 });
-    ta.value = payloadText;
+    ta.value = textForQR;
     const copy = el("button", { class: "primary" }, "Copy");
-    const len = el("div", { class: "kv" }, `${payloadText.length} chars`);
+    const len = el("div", { class: "kv" }, `${textForQR.length} chars · ${payloadBytes.length} packed bytes`);
     body.appendChild(ta);
     body.appendChild(el("div", { class: "btn-group", style: { marginTop: "8px" } }, copy, len));
     body.appendChild(el("p", { class: "hint" }, "Paste this text on the other device's matching screen."));
-    copy.addEventListener("click", () => copyText(payloadText).then(() => toast("Copied")));
+    copy.addEventListener("click", () => copyText(textForQR).then(() => toast("Copied")));
   }
 
   for (const b of tabs.children) {
@@ -137,8 +139,7 @@ export function presentPayload(payloadText, opts = {}) {
   };
 }
 
-// CAPTURE widget: captures payload via QR scan / chirp listen / text paste.
-// Calls onPayload(payloadText) once when complete.
+// CAPTURE widget. onPayload(envelope) where envelope = { type, sdp, id }.
 export function capturePayload(onPayload, opts = {}) {
   const wrap = el("div", { class: "col" });
   const tabs = el("div", { class: "subtabs" },
@@ -162,12 +163,22 @@ export function capturePayload(onPayload, opts = {}) {
     else renderTextMode();
   }
 
-  function deliver(text) {
-    // Strip URL/prefix if present
-    let s = text.trim();
-    if (s.includes("#thinair=")) s = s.split("#thinair=")[1];
-    if (s.startsWith("thinair:")) s = s.slice(8);
-    onPayload(s);
+  function deliverFromText(text) {
+    try {
+      const env = parsePayloadFromText(text);
+      onPayload(env);
+    } catch (e) {
+      onPayload({ error: e.message });
+    }
+  }
+
+  function deliverFromBytes(bytes) {
+    try {
+      const env = parsePayloadFromBytes(bytes);
+      onPayload(env);
+    } catch (e) {
+      onPayload({ error: e.message });
+    }
   }
 
   function renderQRMode() {
@@ -183,7 +194,7 @@ export function capturePayload(onPayload, opts = {}) {
       try {
         scanner = new QRScanner(video);
         await scanner.start(
-          (text) => { status.textContent = "Got QR (" + text.length + " chars)"; deliver(text); },
+          (text) => { status.textContent = "Got QR (" + text.length + " chars)"; deliverFromText(text); },
           (s) => { if (s.kind === "fragment") status.textContent = `Animated QR ${s.have}/${s.total}…`; }
         );
         status.textContent = "Scanning…";
@@ -256,8 +267,7 @@ export function capturePayload(onPayload, opts = {}) {
           onSignal: (s) => {
             if (s.kind === "complete") {
               status.textContent = `Decoded ${s.payload.length} bytes`;
-              const txt = bytesToStr(s.payload);
-              deliver(txt);
+              deliverFromBytes(s.payload);
             } else if (s.kind === "sync-rising") {
               status.textContent = "Sync tone detected, waiting for falling edge…";
             } else if (s.kind === "sync-locked") {
@@ -308,7 +318,7 @@ export function capturePayload(onPayload, opts = {}) {
     submit.addEventListener("click", () => {
       const v = ta.value.trim();
       if (!v) return;
-      deliver(v);
+      deliverFromText(v);
     });
   }
 

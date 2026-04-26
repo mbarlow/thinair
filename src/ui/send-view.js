@@ -5,7 +5,7 @@ import { el, clear, fmtBytes, logger } from "./util.js";
 import { presentPayload, capturePayload } from "./signaling-widgets.js";
 import { createPeer, createOffer, applyAnswer, watchConnection } from "../webrtc/peer.js";
 import { sendFile } from "../webrtc/file-transfer.js";
-import { makeOfferEnvelope, envelopeToString, parsePayload, newSessionId } from "../webrtc/signaling.js";
+import { makeOfferBytes, newSessionId } from "../webrtc/signaling.js";
 
 export function renderSend(root) {
   clear(root);
@@ -127,32 +127,31 @@ export function renderSend(root) {
     stateBig.textContent = "Creating offer";
     logFn("Gathering ICE candidates…");
     const desc = await createOffer(pc);
-    const env = makeOfferEnvelope(desc.sdp, session);
-    const payload = envelopeToString(env);
-    logFn(`Offer ready (${payload.length} chars)`);
+    const offerBytes = makeOfferBytes(desc.sdp, session);
+    logFn(`Offer ready (${offerBytes.length} packed bytes)`);
 
     if (presentWidget) try { presentWidget.dispose(); } catch {}
     clear(offerHost);
-    presentWidget = presentPayload(payload, { sessionId: session });
+    presentWidget = presentPayload(offerBytes, { sessionId: session });
     offerHost.appendChild(presentWidget.node);
 
     if (captureWidget) try { captureWidget.dispose(); } catch {}
     clear(answerHost);
-    captureWidget = capturePayload(async (text) => {
+    captureWidget = capturePayload(async (env) => {
+      if (env.error) { logFn("Answer parse error: " + env.error); return; }
+      if (env.type !== "answer") {
+        logFn("Expected answer, got: " + env.type);
+        return;
+      }
+      if (env.id && env.id !== session) {
+        logFn("Session mismatch: " + env.id + " vs " + session);
+      }
+      logFn("Applying answer…");
+      stateBig.textContent = "Applying answer";
       try {
-        const ans = parsePayload(text);
-        if (ans.type !== "answer") {
-          logFn("Expected answer, got: " + ans.type);
-          return;
-        }
-        if (ans.id && ans.id !== session) {
-          logFn("Session mismatch: " + ans.id + " vs " + session);
-        }
-        logFn("Applying answer…");
-        stateBig.textContent = "Applying answer";
-        await applyAnswer(pc, { type: "answer", sdp: ans.sdp });
+        await applyAnswer(pc, { type: "answer", sdp: env.sdp });
       } catch (e) {
-        logFn("Answer parse error: " + e.message);
+        logFn("applyAnswer error: " + e.message);
       }
     });
     answerHost.appendChild(captureWidget.node);

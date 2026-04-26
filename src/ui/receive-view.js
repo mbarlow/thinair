@@ -5,7 +5,7 @@ import { el, clear, fmtBytes, logger } from "./util.js";
 import { presentPayload, capturePayload } from "./signaling-widgets.js";
 import { createPeer, createAnswer, watchConnection } from "../webrtc/peer.js";
 import { receiveFile, downloadBlob } from "../webrtc/file-transfer.js";
-import { makeAnswerEnvelope, envelopeToString, parsePayload } from "../webrtc/signaling.js";
+import { makeAnswerBytes } from "../webrtc/signaling.js";
 
 export function renderReceive(root) {
   clear(root);
@@ -56,15 +56,15 @@ export function renderReceive(root) {
   });
 
   // Pre-mount capture widget for offer
-  captureWidget = capturePayload(async (text) => {
+  captureWidget = capturePayload(async (off) => {
+    if (off.error) { logFn("Offer parse error: " + off.error); return; }
     try {
-      const off = parsePayload(text);
       if (off.type !== "offer") {
         logFn("Expected offer, got: " + off.type);
         return;
       }
       session = off.id || "thinair";
-      logFn(`Got offer (${text.length} chars)`);
+      logFn(`Got offer (sdp ${off.sdp.length} chars)`);
       stateBig.textContent = "Building answer";
 
       pc = createPeer();
@@ -101,13 +101,12 @@ export function renderReceive(root) {
       });
 
       const desc = await createAnswer(pc, { type: "offer", sdp: off.sdp });
-      const env = makeAnswerEnvelope(desc.sdp, session);
-      const payload = envelopeToString(env);
-      logFn(`Answer ready (${payload.length} chars)`);
+      const ansBytes = makeAnswerBytes(desc.sdp, session);
+      logFn(`Answer ready (${ansBytes.length} packed bytes)`);
 
       if (presentWidget) try { presentWidget.dispose(); } catch {}
       clear(answerHost);
-      presentWidget = presentPayload(payload, { sessionId: session });
+      presentWidget = presentPayload(ansBytes, { sessionId: session });
       answerHost.appendChild(presentWidget.node);
       stateBig.textContent = "Waiting for sender to read answer";
     } catch (e) {
