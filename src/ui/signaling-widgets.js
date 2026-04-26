@@ -258,10 +258,14 @@ export function capturePayload(onPayload, opts = {}) {
               status.textContent = `Decoded ${s.payload.length} bytes`;
               const txt = bytesToStr(s.payload);
               deliver(txt);
-            } else if (s.kind === "sync") {
-              status.textContent = "Sync detected. Reading frame…";
+            } else if (s.kind === "sync-rising") {
+              status.textContent = "Sync tone detected, waiting for falling edge…";
+            } else if (s.kind === "sync-locked") {
+              status.textContent = "Sync locked. Reading frame…";
             } else if (s.kind === "bad-frame") {
-              status.textContent += " · bad frame";
+              status.textContent = "Bad frame (CRC failed) — resyncing…";
+            } else if (s.kind === "abort") {
+              status.textContent = "Aborted (" + s.reason + "), resyncing…";
             }
           },
           onLevel: (lvl) => {

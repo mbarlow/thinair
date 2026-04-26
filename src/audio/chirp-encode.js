@@ -27,17 +27,15 @@ function fillTone(samples, offset, count, freq, sampleRate, amplitude, envelope)
 export function encodeFramesToAudioBuffer(audioCtx, frames, profile) {
   const sr = audioCtx.sampleRate;
   const symbolSamples = Math.floor(profile.symbolMs / 1000 * sr);
-  const gapSamples = Math.floor(profile.gapMs / 1000 * sr);
-  const preambleSymbols = profile.preambleTones.length;
-  const preambleSamples = preambleSymbols * symbolSamples;
-  const interFrameGap = Math.floor(profile.symbolMs * 4 / 1000 * sr); // longer pause between frames
+  const syncSamples = Math.floor(profile.syncMs / 1000 * sr);
+  const syncGapSamples = Math.floor(profile.syncGapMs / 1000 * sr);
+  const interFrameGap = Math.floor(profile.symbolMs * 4 / 1000 * sr);
 
-  // Each frame: preamble + (frameBytes.length * 2) symbols
+  // Each frame: sync tone + silence + (frameBytes.length * 2) symbols + inter-frame gap
   let totalSamples = 0;
   for (const f of frames) {
-    totalSamples += preambleSamples + f.length * 2 * symbolSamples + interFrameGap;
+    totalSamples += syncSamples + syncGapSamples + f.length * 2 * symbolSamples + interFrameGap;
   }
-  totalSamples += gapSamples; // trailing
 
   const buffer = audioCtx.createBuffer(1, Math.max(1, totalSamples), sr);
   const out = buffer.getChannelData(0);
@@ -45,12 +43,12 @@ export function encodeFramesToAudioBuffer(audioCtx, frames, profile) {
   let off = 0;
   const amp = 0.6;
   for (const f of frames) {
-    // preamble
-    for (let i = 0; i < preambleSymbols; i++) {
-      fillTone(out, off, symbolSamples, profile.preambleTones[i], sr, amp, profile.envelope);
-      off += symbolSamples;
-    }
-    // data symbols
+    // Sustained sync tone — the receiver locks the symbol grid on its trailing edge.
+    fillTone(out, off, syncSamples, profile.syncHz, sr, amp, profile.envelope);
+    off += syncSamples;
+    // Silence gap — clean falling edge for sync detection, no symbol grid pollution.
+    off += syncGapSamples;
+    // Data symbols, two per byte (high nibble first).
     for (let i = 0; i < f.length; i++) {
       const hi = (f[i] >> 4) & 0x0f;
       const lo = f[i] & 0x0f;

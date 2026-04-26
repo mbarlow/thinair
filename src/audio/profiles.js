@@ -1,5 +1,5 @@
-// Audio profiles. v1 uses 16-FSK across audible band.
-// Frequencies chosen with non-harmonic spacing to reduce overlap from speaker harmonics.
+// Audio profiles. v1 uses 16-FSK across audible band, with a sustained low-tone
+// preamble for sample-accurate sync.
 
 export const PROFILES = {
   "birdsong-v1": {
@@ -7,15 +7,14 @@ export const PROFILES = {
     mode: "audible",
     symbolMs: 60,
     gapMs: 12,
-    preambleMs: 60,
     repeat: 3,
     payloadBytesPerFrame: 32,
     minHz: 1500,
     maxHz: 4500,
-    // 16 data tones, log-spaced
     tones: logSpaced(1500, 4500, 16),
-    // Distinct preamble tones (outside data band)
-    preambleTones: [1100, 4900, 1100, 4900],
+    syncHz: 800,
+    syncMs: 250,
+    syncGapMs: 50,
     envelope: "soft",
   },
   "modem-v1": {
@@ -23,27 +22,29 @@ export const PROFILES = {
     mode: "audible",
     symbolMs: 50,
     gapMs: 8,
-    preambleMs: 50,
     repeat: 3,
     payloadBytesPerFrame: 32,
     minHz: 1200,
     maxHz: 3600,
     tones: linSpaced(1200, 3600, 16),
-    preambleTones: [900, 4000, 900, 4000],
+    syncHz: 600,
+    syncMs: 200,
+    syncGapMs: 40,
     envelope: "hard",
   },
   "diagnostic-v1": {
     name: "diagnostic-v1",
     mode: "audible",
-    symbolMs: 120,
-    gapMs: 20,
-    preambleMs: 120,
+    symbolMs: 140,
+    gapMs: 30,
     repeat: 2,
-    payloadBytesPerFrame: 16,
+    payloadBytesPerFrame: 8,
     minHz: 1500,
     maxHz: 4500,
-    tones: logSpaced(1500, 4500, 16),
-    preambleTones: [1100, 4900, 1100, 4900],
+    tones: logSpaced(1500, 4500, 8).concat(logSpaced(1500, 4500, 16).slice(8)),
+    syncHz: 800,
+    syncMs: 400,
+    syncGapMs: 100,
     envelope: "soft",
   },
 };

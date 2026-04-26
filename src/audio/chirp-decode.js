@@ -1,23 +1,33 @@
-// FSK decoder. Listens via getUserMedia, slides a symbol window, runs Goertzel
-// detectors at each tone frequency, finds preamble syncs, then reads frames.
+// FSK decoder. Listens via getUserMedia, tracks energy at the sync tone, locks
+// the symbol grid on the falling edge of the preamble, then reads symbols
+// using middle-of-symbol Goertzel windows.
 
 import { getProfile } from "./profiles.js";
 import { parseFrame, FrameAssembler, MAGIC } from "./framing.js";
 
-// Goertzel power for a given target frequency over the provided samples.
+// Goertzel power for a given normalized frequency k = freq/sampleRate.
 function goertzel(samples, off, len, k) {
   const omega = 2 * Math.PI * k;
-  const cos = Math.cos(omega);
-  const coeff = 2 * cos;
-  let s0 = 0, s1 = 0, s2 = 0;
+  const coeff = 2 * Math.cos(omega);
+  let s1 = 0, s2 = 0;
   for (let i = 0; i < len; i++) {
-    s0 = samples[off + i] + coeff * s1 - s2;
+    const s0 = samples[off + i] + coeff * s1 - s2;
     s2 = s1;
     s1 = s0;
   }
-  // power
-  return s1 * s1 + s2 * s2 - coeff * s1 * s2;
+  return (s1 * s1 + s2 * s2 - coeff * s1 * s2) / len; // power-per-sample, comparable across window sizes
 }
+
+// Snapshot Goertzel: window-relative offset and length, into a Float32Array.
+function goertzelOn(buf, off, len, k) {
+  return goertzel(buf, off, len, k);
+}
+
+const STATE = {
+  SEARCH: "search",       // looking for sync energy to rise
+  IN_SYNC: "in-sync",     // sync energy is high, waiting for it to fall
+  LOCKED: "locked",       // sync ended; reading data symbols on the locked grid
+};
 
 export class ChirpDecoder {
   constructor(profileName, opts = {}) {
@@ -28,27 +38,31 @@ export class ChirpDecoder {
     this.processor = null;
     this.stream = null;
     this.running = false;
-    this.buf = null;            // ring buffer of recent samples
+    this.buf = null;
     this.bufWritePos = 0;
     this.bufFilled = 0;
-    this.symbolSamples = 0;
-    this.hopSamples = 0;
+    this.totalSamplesProcessed = 0;
     this.sampleRate = 0;
-    // Goertzel "k" coefficients per tone
+    this.symbolSamples = 0;
+    this.syncWindowSamples = 0;
     this.dataKs = [];
-    this.preambleKs = [];
-    // State
-    this.state = "search";       // "search" | "frame"
-    this.frameSymbols = [];      // array of nibbles being read
+    this.syncK = 0;
+    this.syncGapSamples = 0;
+    this.bandLowK = 0;
+    this.bandHighK = 0;
+    this.state = STATE.SEARCH;
+    this.frameSymbols = [];
     this.frameTargetSymbols = 0;
-    this.symbolClock = 0;        // sample counter for next symbol
+    this.symbolClock = 0;          // next symbol start (absolute sample)
+    this.searchClock = 0;          // sliding search position (absolute sample)
+    this.searchHopSamples = 0;
     this.assembler = new FrameAssembler();
-    this.preambleHistory = [];
-    this.totalBytesProcessed = 0;
+    this.noiseFloor = 1e-9;        // EWMA of "non-signal" sync energy
+    this.peakSync = 0;             // running peak of sync energy in current SYNC episode
+    this.lastLevel = 0;
     this.onFrame = null;
     this.onSignal = null;
     this.onLevel = null;
-    this.lastLevel = 0;
   }
 
   async start({ onFrame, onSignal, onLevel }) {
@@ -56,33 +70,53 @@ export class ChirpDecoder {
     this.onFrame = onFrame;
     this.onSignal = onSignal;
     this.onLevel = onLevel;
+
     this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     if (this.audioCtx.state === "suspended") await this.audioCtx.resume();
     this.sampleRate = this.audioCtx.sampleRate;
-    this.symbolSamples = Math.floor(this.profile.symbolMs / 1000 * this.sampleRate);
-    this.hopSamples = Math.max(1, Math.floor(this.symbolSamples / 4));
-    this.buf = new Float32Array(this.symbolSamples * 32);
+
+    const p = this.profile;
+    this.symbolSamples = Math.floor(p.symbolMs / 1000 * this.sampleRate);
+    this.syncWindowSamples = Math.max(256, Math.floor(0.030 * this.sampleRate)); // 30 ms detection window
+    this.searchHopSamples = Math.max(64, Math.floor(this.syncWindowSamples / 4));
+    this.syncGapSamples = Math.floor(p.syncGapMs / 1000 * this.sampleRate);
+    this.dataKs = p.tones.map((f) => f / this.sampleRate);
+    this.syncK = p.syncHz / this.sampleRate;
+    this.bandLowK = (p.minHz / this.sampleRate);
+    this.bandHighK = (p.maxHz / this.sampleRate);
+
+    // Ring buffer holds at least the longest frame plus one sync episode of history.
+    const maxFrameSyms = 2 * (9 + 255);
+    const maxFrameSamples = maxFrameSyms * this.symbolSamples;
+    const minSyncSamples = Math.floor(p.syncMs / 1000 * this.sampleRate) + this.syncGapSamples;
+    const ringSize = Math.max(this.sampleRate * 2, maxFrameSamples + minSyncSamples + this.sampleRate);
+    this.buf = new Float32Array(ringSize);
     this.bufWritePos = 0;
     this.bufFilled = 0;
-    this.dataKs = this.profile.tones.map((f) => f / this.sampleRate);
-    this.preambleKs = this.profile.preambleTones.map((f) => f / this.sampleRate);
+    this.totalSamplesProcessed = 0;
+    this.searchClock = 0;
+    this.symbolClock = 0;
+    this.state = STATE.SEARCH;
+    this.frameSymbols = [];
+    this.frameTargetSymbols = 0;
+    this.peakSync = 0;
+    this.noiseFloor = 1e-9;
 
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: false,
         noiseSuppression: false,
         autoGainControl: false,
+        channelCount: 1,
       },
       video: false,
     });
     this.source = this.audioCtx.createMediaStreamSource(this.stream);
-    // ScriptProcessorNode (deprecated but universal). 4096 samples ~= 85ms at 48k.
-    // Must have ≥1 output channel; route through a muted gain so mic isn't echoed.
-    this.processor = this.audioCtx.createScriptProcessor(4096, 1, 1);
+    this.processor = this.audioCtx.createScriptProcessor(2048, 1, 1);
     this.processor.onaudioprocess = (ev) => {
       this._onSamples(ev.inputBuffer.getChannelData(0));
-      const out = ev.outputBuffer.getChannelData(0);
-      out.fill(0);
+      const o = ev.outputBuffer.getChannelData(0);
+      o.fill(0);
     };
     this._sink = this.audioCtx.createGain();
     this._sink.gain.value = 0;
@@ -109,138 +143,139 @@ export class ChirpDecoder {
 
   reset() {
     this.assembler = new FrameAssembler();
-    this.state = "search";
+    this.state = STATE.SEARCH;
     this.frameSymbols = [];
-    this.preambleHistory = [];
+    this.frameTargetSymbols = 0;
+    this.peakSync = 0;
   }
 
   _onSamples(input) {
-    // append to ring buffer
     const len = input.length;
-    let lvl = 0;
-    for (let i = 0; i < len; i++) lvl += Math.abs(input[i]);
-    this.lastLevel = lvl / len;
+    let amp = 0;
+    for (let i = 0; i < len; i++) amp += Math.abs(input[i]);
+    this.lastLevel = amp / len;
     if (this.onLevel) this.onLevel(this.lastLevel);
 
-    if (this.bufWritePos + len <= this.buf.length) {
-      this.buf.set(input, this.bufWritePos);
-      this.bufWritePos = (this.bufWritePos + len) % this.buf.length;
+    // append to ring
+    let wp = this.bufWritePos;
+    if (wp + len <= this.buf.length) {
+      this.buf.set(input, wp);
     } else {
-      const first = this.buf.length - this.bufWritePos;
-      this.buf.set(input.subarray(0, first), this.bufWritePos);
+      const first = this.buf.length - wp;
+      this.buf.set(input.subarray(0, first), wp);
       this.buf.set(input.subarray(first), 0);
-      this.bufWritePos = (this.bufWritePos + len) % this.buf.length;
     }
+    this.bufWritePos = (wp + len) % this.buf.length;
     this.bufFilled = Math.min(this.bufFilled + len, this.buf.length);
-    this.totalBytesProcessed += len;
+    this.totalSamplesProcessed += len;
 
     this._process();
   }
 
-  // Get a contiguous Float32Array view of the last `count` samples ending at `endAbs` (absolute sample count)
-  // Returns null if not enough buffered.
+  // Get a contiguous Float32 view of `count` samples ending at absolute sample `endAbs`.
   _readWindow(endAbs, count) {
-    if (this.totalBytesProcessed < endAbs) return null;
-    if (endAbs - count < this.totalBytesProcessed - this.bufFilled) return null;
-    const ringEnd = this.bufWritePos - (this.totalBytesProcessed - endAbs);
-    const startInRing = ((ringEnd - count) % this.buf.length + this.buf.length) % this.buf.length;
-    if (startInRing + count <= this.buf.length) {
-      return this.buf.subarray(startInRing, startInRing + count);
-    } else {
-      const out = new Float32Array(count);
-      const first = this.buf.length - startInRing;
-      out.set(this.buf.subarray(startInRing, this.buf.length), 0);
-      out.set(this.buf.subarray(0, count - first), first);
-      return out;
+    if (this.totalSamplesProcessed < endAbs) return null;
+    if (endAbs - count < this.totalSamplesProcessed - this.bufFilled) return null;
+    const ringEnd = (this.bufWritePos - (this.totalSamplesProcessed - endAbs) + this.buf.length) % this.buf.length;
+    const start = ((ringEnd - count) % this.buf.length + this.buf.length) % this.buf.length;
+    if (start + count <= this.buf.length) {
+      return this.buf.subarray(start, start + count);
     }
+    const out = new Float32Array(count);
+    const first = this.buf.length - start;
+    out.set(this.buf.subarray(start, this.buf.length), 0);
+    out.set(this.buf.subarray(0, count - first), first);
+    return out;
   }
 
-  _bestDataNibble(window) {
-    let best = -1;
-    let bestPow = 0;
+  _bestDataNibble(buf, off, len) {
+    let best = -1, bestPow = 0;
     for (let i = 0; i < this.dataKs.length; i++) {
-      const p = goertzel(window, 0, window.length, this.dataKs[i]);
-      if (p > bestPow) {
-        bestPow = p;
-        best = i;
-      }
+      const p = goertzelOn(buf, off, len, this.dataKs[i]);
+      if (p > bestPow) { bestPow = p; best = i; }
     }
     return { nibble: best, power: bestPow };
   }
 
-  _isPreambleWindow(window) {
-    // Strongest tone among (data ∪ preamble) should be a preamble tone with clear margin.
-    let preamblePow = 0;
-    let preambleIdx = -1;
-    for (let i = 0; i < this.preambleKs.length; i++) {
-      const p = goertzel(window, 0, window.length, this.preambleKs[i]);
-      if (p > preamblePow) { preamblePow = p; preambleIdx = i; }
-    }
-    let dataMaxPow = 0;
-    for (let i = 0; i < this.dataKs.length; i++) {
-      const p = goertzel(window, 0, window.length, this.dataKs[i]);
-      if (p > dataMaxPow) dataMaxPow = p;
-    }
-    // de-dup distinct preamble tones (cycle)
-    return preamblePow > dataMaxPow * 1.5 ? preambleIdx : -1;
-  }
-
   _process() {
-    // Try to consume in steps of `hopSamples` while we have at least symbolSamples buffered ahead of symbolClock.
-    while (this.totalBytesProcessed - this.symbolClock >= this.symbolSamples) {
-      const winEnd = this.symbolClock + this.symbolSamples;
-      const window = this._readWindow(winEnd, this.symbolSamples);
-      if (!window) {
-        this.symbolClock = winEnd;
-        continue;
-      }
-      if (this.state === "search") {
-        const pIdx = this._isPreambleWindow(window);
-        if (pIdx >= 0) {
-          this.preambleHistory.push(pIdx);
-          if (this.preambleHistory.length > this.profile.preambleTones.length) {
-            this.preambleHistory.shift();
+    while (true) {
+      if (this.state === STATE.SEARCH || this.state === STATE.IN_SYNC) {
+        // Slide a sync-detection window every searchHopSamples.
+        const wEnd = this.searchClock + this.syncWindowSamples;
+        if (this.totalSamplesProcessed < wEnd) return;
+        const w = this._readWindow(wEnd, this.syncWindowSamples);
+        if (!w) { this.searchClock += this.searchHopSamples; continue; }
+        const syncPow = goertzelOn(w, 0, w.length, this.syncK);
+        // Compare against in-band data energy as a "is anything else loud?" baseline.
+        const dataPow = goertzelOn(w, 0, w.length, (this.bandLowK + this.bandHighK) / 2);
+
+        if (this.state === STATE.SEARCH) {
+          // EWMA noise floor on quiet frames
+          if (syncPow < this.noiseFloor * 4 || this.noiseFloor < 1e-12) {
+            this.noiseFloor = this.noiseFloor * 0.95 + syncPow * 0.05;
           }
-          // If we've seen the full alternating preamble cycle, lock symbol clock
-          if (this.preambleHistory.length === this.profile.preambleTones.length) {
-            // Sliding step of one symbol — close enough; data starts after this window.
-            if (this.onSignal) this.onSignal({ kind: "sync" });
-            this.state = "frame";
+          const threshHigh = Math.max(this.noiseFloor * 30, 1e-6);
+          if (syncPow > threshHigh && syncPow > dataPow * 1.5) {
+            this.state = STATE.IN_SYNC;
+            this.peakSync = syncPow;
+            if (this.onSignal) this.onSignal({ kind: "sync-rising", energy: syncPow });
+          }
+          this.searchClock += this.searchHopSamples;
+        } else if (this.state === STATE.IN_SYNC) {
+          if (syncPow > this.peakSync) this.peakSync = syncPow;
+          // Falling edge: energy drops to a small fraction of peak.
+          if (syncPow < this.peakSync * 0.15 || syncPow < this.noiseFloor * 8) {
+            // The fall happened somewhere inside this window. Approximate: the
+            // sync ended at the *start* of this window, then a syncGapSamples
+            // silence, then symbols start.
+            const syncEndApprox = wEnd - this.syncWindowSamples;
+            this.symbolClock = syncEndApprox + this.syncGapSamples;
+            this.state = STATE.LOCKED;
             this.frameSymbols = [];
-            this.frameTargetSymbols = 0; // will be set after header
-            this.preambleHistory = [];
-            this.symbolClock = winEnd;
-            continue;
+            this.frameTargetSymbols = 0;
+            this.searchClock = this.symbolClock; // searchClock advances with symbols now
+            if (this.onSignal) this.onSignal({ kind: "sync-locked" });
+          } else {
+            this.searchClock += this.searchHopSamples;
           }
-          this.symbolClock = winEnd;
-        } else {
-          this.preambleHistory = [];
-          this.symbolClock += this.hopSamples;
         }
-      } else if (this.state === "frame") {
-        const { nibble, power } = this._bestDataNibble(window);
+      } else if (this.state === STATE.LOCKED) {
+        // Read one symbol at symbolClock. Sample only the middle 70% to avoid
+        // attack/decay envelopes and any residual sync-tail bleed.
+        const symStart = this.symbolClock;
+        const symEnd = symStart + this.symbolSamples;
+        if (this.totalSamplesProcessed < symEnd) return;
+        const margin = Math.floor(this.symbolSamples * 0.15);
+        const innerLen = this.symbolSamples - 2 * margin;
+        const buf = this._readWindow(symEnd - margin, innerLen);
+        if (!buf) {
+          // Lost the buffer somehow — abort
+          this._abort("buffer-lost");
+          continue;
+        }
+        const { nibble, power } = this._bestDataNibble(buf, 0, buf.length);
         if (nibble < 0 || power <= 0) {
-          // lost signal — bail
-          this.state = "search";
-          this.frameSymbols = [];
-          this.symbolClock += this.hopSamples;
+          this._abort("no-energy");
           continue;
         }
         this.frameSymbols.push(nibble);
-        this.symbolClock = winEnd;
-        // After 7 header bytes (14 symbols), determine total frame size
+        this.symbolClock = symEnd;
+
+        // After 14 symbols we have a 7-byte header; check magic + read len.
         if (this.frameTargetSymbols === 0 && this.frameSymbols.length >= 14) {
           const headerBytes = nibblesToBytes(this.frameSymbols.slice(0, 14));
           if (headerBytes[0] !== MAGIC) {
-            // bad header — abort
-            this.state = "search";
-            this.frameSymbols = [];
+            this._abort("bad-magic");
             continue;
           }
           const len = headerBytes[6];
-          // total frame bytes = 7 header + len + 2 crc = 9 + len; total symbols = 2 * (9 + len)
           this.frameTargetSymbols = 2 * (9 + len);
+          if (this.frameTargetSymbols > 2 * (9 + 255)) {
+            this._abort("len-too-big");
+            continue;
+          }
         }
+
         if (this.frameTargetSymbols > 0 && this.frameSymbols.length >= this.frameTargetSymbols) {
           const bytes = nibblesToBytes(this.frameSymbols.slice(0, this.frameTargetSymbols));
           const parsed = parseFrame(bytes);
@@ -262,12 +297,23 @@ export class ChirpDecoder {
           } else if (this.onSignal) {
             this.onSignal({ kind: "bad-frame" });
           }
-          this.state = "search";
+          this.state = STATE.SEARCH;
           this.frameSymbols = [];
           this.frameTargetSymbols = 0;
+          this.peakSync = 0;
+          this.searchClock = this.symbolClock;
         }
       }
     }
+  }
+
+  _abort(reason) {
+    if (this.onSignal) this.onSignal({ kind: "abort", reason });
+    this.state = STATE.SEARCH;
+    this.frameSymbols = [];
+    this.frameTargetSymbols = 0;
+    this.peakSync = 0;
+    this.searchClock = this.symbolClock;
   }
 }
 
