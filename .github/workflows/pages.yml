@@ -31,6 +31,12 @@ jobs:
             -e "s|__BUILD_TIME__|${BUILT_AT}|g" \
             -e "s|__BUILD_BRANCH__|${BRANCH}|g" \
             index.html
+          # Cache-bust: append ?v=<sha> to entry script and to every relative
+          # ES module import so a new deploy invalidates the whole graph.
+          sed -i -E "s|(src=\"\\./src/app\\.js)\"|\\1?v=${SHA_SHORT}\"|" index.html
+          find src -type f -name "*.js" -print0 | xargs -0 sed -i -E \
+            "s|(from[[:space:]]+[\"'](\\.{1,2}/[^\"']+\\.js))([\"'])|\\1?v=${SHA_SHORT}\\3|g; \
+             s|(import\\([[:space:]]*[\"'](\\.{1,2}/[^\"']+\\.js))([\"'])|\\1?v=${SHA_SHORT}\\3|g"
           echo "{\"sha\":\"${GITHUB_SHA}\",\"shaShort\":\"${SHA_SHORT}\",\"builtAt\":\"${BUILT_AT}\",\"branch\":\"${BRANCH}\"}" > build.json
           echo "Built ${SHA_SHORT} at ${BUILT_AT}"
 
