@@ -77,16 +77,25 @@ export class ChirpDecoder {
     });
     this.source = this.audioCtx.createMediaStreamSource(this.stream);
     // ScriptProcessorNode (deprecated but universal). 4096 samples ~= 85ms at 48k.
-    this.processor = this.audioCtx.createScriptProcessor(4096, 1, 0);
-    this.processor.onaudioprocess = (ev) => this._onSamples(ev.inputBuffer.getChannelData(0));
+    // Must have ≥1 output channel; route through a muted gain so mic isn't echoed.
+    this.processor = this.audioCtx.createScriptProcessor(4096, 1, 1);
+    this.processor.onaudioprocess = (ev) => {
+      this._onSamples(ev.inputBuffer.getChannelData(0));
+      const out = ev.outputBuffer.getChannelData(0);
+      out.fill(0);
+    };
+    this._sink = this.audioCtx.createGain();
+    this._sink.gain.value = 0;
     this.source.connect(this.processor);
-    this.processor.connect(this.audioCtx.destination);
+    this.processor.connect(this._sink);
+    this._sink.connect(this.audioCtx.destination);
     this.running = true;
   }
 
   stop() {
     this.running = false;
     try { if (this.processor) this.processor.disconnect(); } catch {}
+    try { if (this._sink) this._sink.disconnect(); } catch {}
     try { if (this.source) this.source.disconnect(); } catch {}
     if (this.stream) {
       for (const t of this.stream.getTracks()) t.stop();
