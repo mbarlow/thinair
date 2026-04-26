@@ -23,7 +23,22 @@ function waitFor(predicate, timeoutMs = 5000) {
   });
 }
 
+function fixupBuildPlaceholders() {
+  // Local dev (no CI substitution): show "dev" instead of the literal placeholder.
+  const isPlaceholder = (s) => typeof s === "string" && s.includes("__BUILD_");
+  for (const a of document.querySelectorAll("a, meta")) {
+    if (a.tagName === "META") {
+      if (isPlaceholder(a.content)) a.content = "dev";
+      continue;
+    }
+    if (a.textContent && isPlaceholder(a.textContent)) a.textContent = a.textContent.replace(/__BUILD_SHA__/g, "dev");
+    if (a.href && isPlaceholder(a.href)) a.href = "https://github.com/mbarlow/thinair";
+    if (a.title && isPlaceholder(a.title)) a.title = "local dev build";
+  }
+}
+
 (async () => {
+  fixupBuildPlaceholders();
   try {
     await waitFor(() => typeof window.qrcode === "function" && window.jsQR && window.pako);
   } catch (e) {

@@ -1,0 +1,51 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Inject build metadata
+        run: |
+          SHA_SHORT="${GITHUB_SHA::7}"
+          BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          BRANCH="${GITHUB_REF_NAME}"
+          sed -i \
+            -e "s|__BUILD_SHA__|${SHA_SHORT}|g" \
+            -e "s|__BUILD_FULL_SHA__|${GITHUB_SHA}|g" \
+            -e "s|__BUILD_TIME__|${BUILT_AT}|g" \
+            -e "s|__BUILD_BRANCH__|${BRANCH}|g" \
+            index.html
+          echo "{\"sha\":\"${GITHUB_SHA}\",\"shaShort\":\"${SHA_SHORT}\",\"builtAt\":\"${BUILT_AT}\",\"branch\":\"${BRANCH}\"}" > build.json
+          echo "Built ${SHA_SHORT} at ${BUILT_AT}"
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
