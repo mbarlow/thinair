@@ -1,18 +1,7 @@
-// ThinAir entry point.
-import { on, init, go } from "./router.js";
-import { renderHome } from "./ui/home-view.js";
-import { renderSend } from "./ui/send-view.js";
-import { renderReceive } from "./ui/receive-view.js";
-import { renderManual } from "./ui/manual-view.js";
+// ThinAir entry point. PWA-ready single-flow app.
+import { startApp } from "./ui/app-flow.js";
 import { renderDiagnostics } from "./ui/diagnostics-view.js";
 
-on("/", renderHome);
-on("/send", renderSend);
-on("/receive", renderReceive);
-on("/manual", renderManual);
-on("/diagnostics", renderDiagnostics);
-
-// Wait for CDN libs to load before initializing the router so views see them.
 function waitFor(predicate, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
     const t0 = Date.now();
@@ -24,7 +13,6 @@ function waitFor(predicate, timeoutMs = 5000) {
 }
 
 function fixupBuildPlaceholders() {
-  // Local dev (no CI substitution): show "dev" instead of the literal placeholder.
   const isPlaceholder = (s) => typeof s === "string" && s.includes("__BUILD_");
   for (const a of document.querySelectorAll("a, meta")) {
     if (a.tagName === "META") {
@@ -37,25 +25,36 @@ function fixupBuildPlaceholders() {
   }
 }
 
+function dispatchHash() {
+  const raw = (location.hash || "").slice(1);
+  if (raw === "/diagnostics") {
+    renderDiagnostics(document.getElementById("stage"));
+    return true;
+  }
+  return false;
+}
+
 (async () => {
   fixupBuildPlaceholders();
   try {
     await waitFor(() => typeof window.qrcode === "function" && window.jsQR && window.pako);
   } catch (e) {
-    // Continue anyway — diagnostics will still surface issues.
     console.warn("CDN libs not fully loaded:", e);
   }
 
-  // If page was opened with a #thinair=... payload, the home page can prompt the user.
-  // For v1 we just route to home; the user can paste it into Receive/Manual.
-  init();
-
-  // If hash has a thinair payload, hint the user.
-  const raw = (location.hash || "").slice(1);
-  if (raw.startsWith("/thinair=") || raw.startsWith("thinair=")) {
-    const payload = raw.replace(/^\/?thinair=/, "");
-    sessionStorage.setItem("thinair-incoming", payload);
-    // Auto-route to receive
-    go("/receive");
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./service-worker.js").catch(() => {});
   }
+
+  if (dispatchHash()) {
+    window.addEventListener("hashchange", () => {
+      if (!dispatchHash()) startApp();
+    });
+    return;
+  }
+
+  startApp();
+  window.addEventListener("hashchange", () => {
+    if (!dispatchHash()) startApp();
+  });
 })();

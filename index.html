@@ -3,37 +3,27 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0a0a0a" />
+  <meta name="theme-color" content="#050608" />
   <title>ThinAir</title>
   <meta name="thinair-build-sha" content="__BUILD_SHA__" />
   <meta name="thinair-build-time" content="__BUILD_TIME__" />
   <meta name="thinair-build-branch" content="__BUILD_BRANCH__" />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="icon" href="./icon.svg" />
+  <link rel="apple-touch-icon" href="./icon.svg" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <link rel="stylesheet" href="./styles.css" />
-  <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><circle cx='32' cy='32' r='28' fill='none' stroke='%23fff' stroke-width='2'/><path d='M16 32h32M32 16v32' stroke='%23fff' stroke-width='2'/></svg>" />
   <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js" defer></script>
   <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js" defer></script>
   <script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js" defer></script>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="logo"></span>
-      <span class="title">ThinAir</span>
-    </div>
-    <nav class="nav">
-      <a href="#/" data-route="home">Home</a>
-      <a href="#/diagnostics" data-route="diagnostics">Diagnostics</a>
-      <a href="https://github.com/mbarlow/thinair/commit/__BUILD_FULL_SHA__" target="_blank" rel="noopener" title="Built __BUILD_TIME__ on __BUILD_BRANCH__" style="font-family: ui-monospace, monospace;">__BUILD_SHA__</a>
-    </nav>
-  </header>
+  <main id="stage" class="stage"></main>
 
-  <main id="app"></main>
-
-  <footer class="bottombar">
-    <span class="muted">Files travel over WebRTC. The handshake travels through air.</span>
-    <span class="muted" style="margin-left: 12px;">·</span>
-    <a class="muted" id="build-link" href="https://github.com/mbarlow/thinair/commits/master" target="_blank" rel="noopener" style="margin-left: 12px; font-family: ui-monospace, monospace;">build __BUILD_SHA__</a>
-  </footer>
+  <div class="build-pill">
+    <a href="https://github.com/mbarlow/thinair/commit/__BUILD_FULL_SHA__" target="_blank" rel="noopener" title="Built __BUILD_TIME__ on __BUILD_BRANCH__">__BUILD_SHA__</a>
+  </div>
 
   <script type="module" src="./src/app.js"></script>
 </body>
