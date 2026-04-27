@@ -9,8 +9,8 @@ const SHELL = [
   "./index.html",
   "./styles.css",
   "./manifest.webmanifest",
-  "./icon.svg",
-  "./icon-maskable.svg",
+  "./app-icon.svg",
+  "./app-icon-mask.svg",
 ];
 
 self.addEventListener("install", (e) => {
