@@ -136,22 +136,17 @@ input[type="text"], input[type="number"], textarea, select {
 .home-brand p { margin: 0; }
 
 .logo {
-  width: 28px; height: 28px;
-  border: 1.6px solid var(--text);
-  border-radius: 50%;
-  position: relative;
+  width: 32px;
+  height: 32px;
   display: inline-block;
+  background: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><path d='M448 96 L80 240 L208 280 L256 416 L296 312 L448 96 Z' fill='%236ee7ff' stroke='%23a4f4ff' stroke-width='6' stroke-linejoin='round'/><path d='M448 96 L208 280 L296 312 Z' fill='%233ea9c0' opacity='0.55'/></svg>") center/contain no-repeat;
 }
-.logo::before, .logo::after { content: ""; position: absolute; background: var(--text); }
-.logo::before { left: 50%; top: 2px; bottom: 2px; width: 1.6px; margin-left: -0.8px; }
-.logo::after { top: 50%; left: 2px; right: 2px; height: 1.6px; margin-top: -0.8px; }
 .logo.big {
-  width: 64px; height: 64px;
-  border-width: 2.5px;
-  margin-bottom: 8px;
+  width: 96px;
+  height: 96px;
+  margin-bottom: 4px;
+  filter: drop-shadow(0 6px 24px rgba(110, 231, 255, 0.35));
 }
-.logo.big::before { width: 2.5px; margin-left: -1.25px; top: 6px; bottom: 6px; }
-.logo.big::after  { height: 2.5px; margin-top: -1.25px;  left: 6px; right: 6px; }
 
 .home-actions {
   display: grid;

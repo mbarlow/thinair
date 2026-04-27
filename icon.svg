@@ -4,10 +4,18 @@
       <stop offset="0%" stop-color="#0e1014"/>
       <stop offset="100%" stop-color="#050608"/>
     </radialGradient>
+    <linearGradient id="plane" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#a4f4ff"/>
+      <stop offset="100%" stop-color="#6ee7ff"/>
+    </linearGradient>
   </defs>
   <rect width="512" height="512" rx="96" fill="url(#bg)"/>
-  <circle cx="256" cy="256" r="160" fill="none" stroke="#e8eaee" stroke-width="14"/>
-  <line x1="256" y1="96"  x2="256" y2="416" stroke="#e8eaee" stroke-width="14"/>
-  <line x1="96"  y1="256" x2="416" y2="256" stroke="#e8eaee" stroke-width="14"/>
-  <circle cx="256" cy="256" r="40" fill="#6ee7ff"/>
+  <!-- trail / wake lines -->
+  <path d="M84 332 L196 304" stroke="#1f3a44" stroke-width="10" stroke-linecap="round" fill="none" opacity="0.7"/>
+  <path d="M104 380 L224 348" stroke="#1f3a44" stroke-width="10" stroke-linecap="round" fill="none" opacity="0.45"/>
+  <!-- paper plane: outer body -->
+  <path d="M448 96 L80 240 L208 280 L256 416 L296 312 L448 96 Z"
+        fill="url(#plane)" stroke="#7df2ff" stroke-width="6" stroke-linejoin="round"/>
+  <!-- inner fold shadow -->
+  <path d="M448 96 L208 280 L296 312 Z" fill="#3ea9c0" opacity="0.55"/>
 </svg>

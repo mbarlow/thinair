@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <rect width="512" height="512" fill="#050608"/>
-  <circle cx="256" cy="256" r="120" fill="none" stroke="#e8eaee" stroke-width="14"/>
-  <line x1="256" y1="136" x2="256" y2="376" stroke="#e8eaee" stroke-width="14"/>
-  <line x1="136" y1="256" x2="376" y2="256" stroke="#e8eaee" stroke-width="14"/>
-  <circle cx="256" cy="256" r="32" fill="#6ee7ff"/>
+  <!-- maskable safe-zone is the central 80%; keep plane inside it -->
+  <path d="M412 156 L140 268 L240 300 L280 396 L312 320 L412 156 Z"
+        fill="#6ee7ff" stroke="#a4f4ff" stroke-width="6" stroke-linejoin="round"/>
+  <path d="M412 156 L240 300 L312 320 Z" fill="#3ea9c0" opacity="0.55"/>
 </svg>
