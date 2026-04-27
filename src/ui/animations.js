@@ -1,12 +1,10 @@
 // QR-shatter animations and crossfades.
 //
-// Public API:
-//   shatterQR(host, options) -> Promise<void>
-//      Splits whatever was rendered inside `host` into a grid of tiles and
-//      animates them out using a random style. Resolves when the animation
-//      finishes; `host` is left empty.
-//   crossfadeIn(node, opts) -> Promise<void>
-//      Fades + scales `node` into view from a small initial offset.
+// shatterQR(host) lifts the rendered QR canvas onto a fixed-position overlay
+// at the top of the document, splits it into a tile grid, and animates the
+// tiles outward across the whole viewport. Lifting to a fixed overlay is the
+// trick that lets the tiles fly outside the QR frame even when the page is
+// crossfading underneath them.
 
 const STYLES = ["scatter", "explode", "shake", "dissolve", "fade"];
 
@@ -14,28 +12,38 @@ export function pickStyle() {
   return STYLES[Math.floor(Math.random() * STYLES.length)];
 }
 
-// Take any DOM node containing a single canvas (or descendant canvas) and
-// shatter it into a tile grid that animates out.
 export async function shatterQR(host, opts = {}) {
-  const cols = opts.cols || 14;
-  const rows = opts.rows || 14;
+  const cols = opts.cols || 12;
+  const rows = opts.rows || 12;
   const style = opts.style || pickStyle();
+  const duration = opts.duration || 520;
   const canvas = host.querySelector("canvas");
   if (!canvas) {
     host.innerHTML = "";
     return;
   }
+
+  // Snapshot the canvas, then size + position an overlay where the QR sits.
   const dataURL = canvas.toDataURL("image/png");
-  const w = host.clientWidth || canvas.width;
-  const h = host.clientHeight || canvas.height;
-  // Create a tile container the same size; replace original content.
-  host.innerHTML = "";
-  host.style.position = host.style.position || "relative";
-  const container = document.createElement("div");
-  container.style.position = "absolute";
-  container.style.inset = "0";
-  container.style.pointerEvents = "none";
-  host.appendChild(container);
+  const rect = host.getBoundingClientRect();
+  const w = rect.width;
+  const h = rect.height;
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+
+  // Hide the original immediately so the user only sees the overlay.
+  host.style.visibility = "hidden";
+
+  const overlay = document.createElement("div");
+  overlay.style.position = "fixed";
+  overlay.style.left = rect.left + "px";
+  overlay.style.top = rect.top + "px";
+  overlay.style.width = w + "px";
+  overlay.style.height = h + "px";
+  overlay.style.pointerEvents = "none";
+  overlay.style.zIndex = "1000";
+  overlay.style.willChange = "transform, opacity";
+  document.body.appendChild(overlay);
 
   const tileW = w / cols;
   const tileH = h / rows;
@@ -52,64 +60,76 @@ export async function shatterQR(host, opts = {}) {
       t.style.backgroundSize = `${w}px ${h}px`;
       t.style.backgroundPosition = `${-c * tileW}px ${-r * tileH}px`;
       t.style.willChange = "transform, opacity, filter";
-      t.style.transition = "transform 600ms cubic-bezier(.2,.7,.2,1), opacity 600ms ease, filter 600ms ease";
-      container.appendChild(t);
+      t.style.transition =
+        `transform ${duration}ms cubic-bezier(.2,.7,.2,1), ` +
+        `opacity ${duration}ms ease, ` +
+        `filter ${duration}ms ease`;
+      overlay.appendChild(t);
       tiles.push({ t, c, r });
     }
   }
 
+  // Force a layout flush so the initial styles are committed.
   await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 
   if (style === "scatter") {
     for (const { t } of tiles) {
-      const dx = (Math.random() - 0.5) * w * 1.6;
-      const dy = (Math.random() - 0.5) * h * 1.6;
-      const rot = (Math.random() - 0.5) * 240;
-      t.style.transform = `translate(${dx}px, ${dy}px) rotate(${rot}deg)`;
+      const dx = (Math.random() - 0.5) * vw * 1.4;
+      const dy = (Math.random() - 0.5) * vh * 1.4;
+      const rot = (Math.random() - 0.5) * 720;
+      t.style.transform = `translate(${dx}px, ${dy}px) rotate(${rot}deg) scale(0.7)`;
       t.style.opacity = "0";
     }
   } else if (style === "explode") {
+    const cx = w / 2;
+    const cy = h / 2;
     for (const { t, c, r } of tiles) {
-      const cx = (c - cols / 2 + 0.5) * tileW;
-      const cy = (r - rows / 2 + 0.5) * tileH;
-      const len = Math.hypot(cx, cy) || 1;
-      const dx = (cx / len) * w * 1.2;
-      const dy = (cy / len) * h * 1.2;
-      t.style.transform = `translate(${dx}px, ${dy}px) scale(0.6) rotate(${(c + r) * 18}deg)`;
+      const tx = (c + 0.5) * tileW - cx;
+      const ty = (r + 0.5) * tileH - cy;
+      const len = Math.hypot(tx, ty) || 1;
+      const dx = (tx / len) * Math.max(vw, vh) * 0.9;
+      const dy = (ty / len) * Math.max(vw, vh) * 0.9;
+      t.style.transform = `translate(${dx}px, ${dy}px) scale(0.4) rotate(${(c + r) * 24}deg)`;
       t.style.opacity = "0";
     }
   } else if (style === "shake") {
     for (const { t } of tiles) {
-      const sx = (Math.random() - 0.5) * 12;
-      const sy = (Math.random() - 0.5) * 12;
+      const sx = (Math.random() - 0.5) * 18;
+      const sy = (Math.random() - 0.5) * 18;
       t.style.transform = `translate(${sx}px, ${sy}px)`;
     }
     await new Promise((r) => setTimeout(r, 120));
     for (const { t } of tiles) {
-      t.style.transform = "scale(1.05)";
+      const dy = (Math.random() - 0.4) * h * 1.5;
+      const dx = (Math.random() - 0.5) * w * 1.2;
+      t.style.transform = `translate(${dx}px, ${dy}px) scale(0.6) rotate(${(Math.random() - 0.5) * 540}deg)`;
       t.style.opacity = "0";
     }
   } else if (style === "dissolve") {
     for (const { t } of tiles) {
-      t.style.transition += ", filter 600ms ease";
-      t.style.filter = "blur(8px)";
+      const dx = (Math.random() - 0.5) * 40;
+      const dy = (Math.random() - 0.5) * 40;
+      t.style.filter = "blur(14px)";
+      t.style.transform = `translate(${dx}px, ${dy}px) scale(1.1)`;
       t.style.opacity = "0";
     }
   } else { // fade
     for (const { t } of tiles) {
-      const dy = (Math.random() - 0.5) * 24;
-      t.style.transform = `translateY(${dy}px) scale(0.9)`;
+      const dy = (Math.random() - 0.3) * 80;
+      const dx = (Math.random() - 0.5) * 80;
+      t.style.transform = `translate(${dx}px, ${dy}px) scale(0.9)`;
       t.style.opacity = "0";
     }
   }
 
-  await new Promise((r) => setTimeout(r, 640));
+  await new Promise((r) => setTimeout(r, duration + 40));
+  overlay.remove();
   host.innerHTML = "";
-  host.style.position = "";
+  host.style.visibility = "";
 }
 
 export async function crossfadeIn(node, opts = {}) {
-  const dur = opts.duration || 320;
+  const dur = opts.duration || 280;
   node.style.transition = `opacity ${dur}ms ease, transform ${dur}ms cubic-bezier(.2,.7,.2,1)`;
   node.style.opacity = "0";
   node.style.transform = opts.from || "translateY(8px) scale(0.98)";
@@ -121,9 +141,9 @@ export async function crossfadeIn(node, opts = {}) {
 }
 
 export async function crossfadeOut(node, opts = {}) {
-  const dur = opts.duration || 280;
+  const dur = opts.duration || 220;
   node.style.transition = `opacity ${dur}ms ease, transform ${dur}ms ease`;
   node.style.opacity = "0";
-  node.style.transform = opts.to || "translateY(-8px) scale(0.98)";
+  node.style.transform = opts.to || "translateY(-6px) scale(0.98)";
   await new Promise((r) => setTimeout(r, dur));
 }

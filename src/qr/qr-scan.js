@@ -13,18 +13,22 @@ export class QRScanner {
     this.lastDecoded = null;
   }
 
-  async start(onResult, onStatus) {
+  async start(onResult, onStatus, opts = {}) {
     if (this.running) return;
     this.running = true;
     if (!window.jsQR) throw new Error("jsQR not loaded");
-    try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: false,
-      });
-    } catch (e) {
-      this.running = false;
-      throw e;
+    if (opts.stream) {
+      this.stream = opts.stream;
+    } else {
+      try {
+        this.stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false,
+        });
+      } catch (e) {
+        this.running = false;
+        throw e;
+      }
     }
     this.video.srcObject = this.stream;
     this.video.setAttribute("playsinline", "true");

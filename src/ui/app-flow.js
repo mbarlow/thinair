@@ -113,6 +113,7 @@ async function startSendFlow(files) {
   // Show offer QR + listen for receiver's "I'm ready" cue.
   const cueListener = new CueListener();
   let scannedAlready = false;
+  let prewarmStream = null;
 
   await transition(() => {
     const node = buildSendQRScreen({
@@ -120,9 +121,18 @@ async function startSendFlow(files) {
       offerText,
       onManualScan: () => { /* no-op until cue or button */ },
     });
-    node._dispose = () => { try { cueListener.stop(); } catch {} };
+    node._dispose = () => {
+      try { cueListener.stop(); } catch {}
+      if (prewarmStream) for (const t of prewarmStream.getTracks()) t.stop();
+    };
     return node;
   });
+
+  // Pre-warm the camera so the scan transition is hot.
+  navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false,
+  }).then((s) => { prewarmStream = s; }).catch(() => {});
 
   let cueHeard = false;
   const advanceToScan = async () => {
@@ -130,7 +140,13 @@ async function startSendFlow(files) {
     cueHeard = true;
     cueListener.stop();
     if (scannedAlready) return;
-    await shatterCurrentQR();
+    // Run shatter and the scan-screen transition in parallel so the wait
+    // hidden behind the animation isn't visible.
+    const status = document.querySelector(".cue-status");
+    if (status) status.textContent = "✓ Receiver ready — switching to camera…";
+    const shatterP = shatterCurrentQR();
+    const stream = prewarmStream;
+    prewarmStream = null;
     await transition(() => buildScanScreen("Scan the receiver's code", async (env) => {
       if (scannedAlready) return;
       scannedAlready = true;
@@ -142,7 +158,8 @@ async function startSendFlow(files) {
       } catch (e) {
         await transition(() => buildErrorScreen("Couldn't apply answer", e.message));
       }
-    }));
+    }, { stream }));
+    await shatterP;
   };
 
   // Try mic; if denied, show a manual button on the QR screen.
@@ -179,7 +196,7 @@ function buildSendQRScreen({ files, offerText }) {
     el("div", { class: "manual-ready-row btn-group center", style: { display: "none", marginTop: "12px" } },
       el("button", { class: "btn primary" }, "Receiver ready — switch to my camera")
     ),
-    el("p", { class: "hint center" }, "When the receiver shows their code, this device will switch to camera mode automatically.")
+    el("p", { class: "hint center cue-status" }, "When the receiver shows their code, this device will switch to camera mode automatically.")
   );
   setTimeout(() => renderQR(qrHost, offerText, { size: Math.min(360, qrHost.clientWidth || 360) }).catch(() => {}), 0);
   return wrap;
@@ -352,7 +369,7 @@ function receivingUIRefs() {
 
 // ─── SHARED SCREENS ──────────────────────────────────────────────────────────
 
-function buildScanScreen(title, onResult) {
+function buildScanScreen(title, onResult, opts = {}) {
   const video = el("video", { muted: true, playsinline: true, autoplay: true });
   const scanBox = el("div", { class: "scan-stage" }, video, el("div", { class: "scan-overlay" }));
   const status = el("div", { class: "kv center", style: { marginTop: "8px" } }, "Starting camera…");
@@ -376,7 +393,8 @@ function buildScanScreen(title, onResult) {
             await onResult({ error: e.message });
           }
         },
-        (s) => { if (s.kind === "fragment") status.textContent = `Animated QR ${s.have}/${s.total}…`; }
+        (s) => { if (s.kind === "fragment") status.textContent = `Animated QR ${s.have}/${s.total}…`; },
+        { stream: opts.stream }
       );
       status.textContent = "Scanning…";
     } catch (e) {

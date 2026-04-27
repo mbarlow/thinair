@@ -1,38 +1,48 @@
-// Tiny audio cue: a short tone burst used as a UX-only "step done" signal
-// between devices. No data — the receiver just needs to know "the other
-// device finished its step, switch UI now."
+// Step-done audio cue. UX-only signal that says "your turn"; carries no data.
 //
-// Burst design: a triple-tap of 2 kHz tones (220 ms each, 90 ms gap), so the
-// pattern is rhythmically distinguishable from incidental room noise even at
-// modest volume. Detection uses a Goertzel filter at the same frequency and
-// counts three energy peaks within a 1.5 s window.
+// Sound: a soft two-note chime — E5 (659 Hz) up to B5 (988 Hz). Long enough
+// for a Goertzel detector to lock fast, short enough not to be annoying,
+// pitched in a clean register so phone speakers reproduce it cleanly and the
+// detection band sits well above HVAC/voice clutter.
+//
+// Detector: Goertzel at the *upper* tone (988 Hz, less likely to coincide
+// with random room noise). One sustained ~120 ms detection above threshold
+// fires the callback. Latency from cue start to "your turn" is typically
+// 200–250 ms — fast enough that the sender's UI feels responsive.
 
-const CUE_HZ = 2000;
-const PULSE_MS = 220;
-const GAP_MS = 90;
-const PULSES = 3;
+const TONE1_HZ = 659.25; // E5
+const TONE2_HZ = 987.77; // B5
+const TONE1_MS = 180;
+const GAP_MS = 30;
+const TONE2_MS = 220;
+
+const DETECT_HZ = TONE2_HZ;
 const DETECT_WINDOW_MS = 30;
-const PEAK_THRESHOLD = 1.6e-3; // tuned for unit-amplitude FFT-style scaling
+const SUSTAIN_MS = 120; // need this many ms of continuous above-threshold
+const PEAK_THRESHOLD = 1.5e-3;
+
+function softTone(out, off, count, freq, sr, amp) {
+  const omega = 2 * Math.PI * freq / sr;
+  const fade = Math.min(count / 4, Math.floor(0.018 * sr)); // 18 ms attack/release
+  for (let i = 0; i < count; i++) {
+    let env = 1;
+    if (i < fade) env = 0.5 * (1 - Math.cos(Math.PI * i / fade));
+    else if (i > count - fade) env = 0.5 * (1 - Math.cos(Math.PI * (count - i) / fade));
+    out[off + i] = amp * env * Math.sin(omega * i);
+  }
+}
 
 export function buildCueBuffer(audioCtx) {
   const sr = audioCtx.sampleRate;
-  const pulseSamples = Math.floor(PULSE_MS / 1000 * sr);
-  const gapSamples = Math.floor(GAP_MS / 1000 * sr);
-  const total = pulseSamples * PULSES + gapSamples * (PULSES - 1) + Math.floor(0.05 * sr);
+  const n1 = Math.floor(TONE1_MS / 1000 * sr);
+  const ng = Math.floor(GAP_MS / 1000 * sr);
+  const n2 = Math.floor(TONE2_MS / 1000 * sr);
+  const tail = Math.floor(0.06 * sr);
+  const total = n1 + ng + n2 + tail;
   const buffer = audioCtx.createBuffer(1, total, sr);
   const out = buffer.getChannelData(0);
-  const omega = 2 * Math.PI * CUE_HZ / sr;
-  let off = 0;
-  for (let p = 0; p < PULSES; p++) {
-    const fade = Math.min(pulseSamples / 4, Math.floor(0.012 * sr));
-    for (let i = 0; i < pulseSamples; i++) {
-      let env = 1;
-      if (i < fade) env = 0.5 * (1 - Math.cos(Math.PI * i / fade));
-      else if (i > pulseSamples - fade) env = 0.5 * (1 - Math.cos(Math.PI * (pulseSamples - i) / fade));
-      out[off + i] = 0.5 * env * Math.sin(omega * i);
-    }
-    off += pulseSamples + gapSamples;
-  }
+  softTone(out, 0, n1, TONE1_HZ, sr, 0.4);
+  softTone(out, n1 + ng, n2, TONE2_HZ, sr, 0.42);
   return buffer;
 }
 
@@ -43,7 +53,7 @@ export async function playCue(audioCtx) {
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
   const g = audioCtx.createGain();
-  g.gain.value = 0.9;
+  g.gain.value = 0.95;
   src.connect(g);
   g.connect(audioCtx.destination);
   src.start();
@@ -62,8 +72,8 @@ function goertzel(samples, len, k) {
   return (s1 * s1 + s2 * s2 - coeff * s1 * s2) / len;
 }
 
-// Listen for the cue. Calls onCue() once when the 3-pulse pattern is heard.
-// Returns a stop() function. Yields false from start() if the user denies mic.
+// Listen for the cue. Calls onCue() the first time the detection tone is
+// sustained above threshold for SUSTAIN_MS. Returns false if mic is denied.
 export class CueListener {
   constructor() {
     this.audioCtx = null;
@@ -72,8 +82,8 @@ export class CueListener {
     this.sink = null;
     this.stream = null;
     this.running = false;
-    this.peakTimes = [];
-    this.aboveThreshold = false;
+    this.aboveSinceTime = 0;
+    this._fired = false;
     this.onCue = null;
   }
 
@@ -97,33 +107,33 @@ export class CueListener {
     if (this.audioCtx.state === "suspended") await this.audioCtx.resume();
     const sr = this.audioCtx.sampleRate;
     const winSamples = Math.max(256, Math.floor(DETECT_WINDOW_MS / 1000 * sr));
+    const sustainSec = SUSTAIN_MS / 1000;
+    const detectK = DETECT_HZ / sr;
+
     this.source = this.audioCtx.createMediaStreamSource(this.stream);
     this.processor = this.audioCtx.createScriptProcessor(2048, 1, 1);
     let buffered = new Float32Array(0);
-    const k = CUE_HZ / sr;
+
     this.processor.onaudioprocess = (ev) => {
       const inp = ev.inputBuffer.getChannelData(0);
       ev.outputBuffer.getChannelData(0).fill(0);
-      // simple sliding window
       const cat = new Float32Array(buffered.length + inp.length);
       cat.set(buffered, 0);
       cat.set(inp, buffered.length);
       let i = 0;
       while (i + winSamples <= cat.length) {
         const win = cat.subarray(i, i + winSamples);
-        const p = goertzel(win, win.length, k);
-        const above = p > PEAK_THRESHOLD;
-        if (above && !this.aboveThreshold) {
-          this.peakTimes.push(this.audioCtx.currentTime);
-          // drop peaks older than DETECT_WINDOW
-          const cutoff = this.audioCtx.currentTime - 1.5;
-          while (this.peakTimes.length && this.peakTimes[0] < cutoff) this.peakTimes.shift();
-          if (this.peakTimes.length >= PULSES && !this._fired) {
+        const p = goertzel(win, win.length, detectK);
+        const t = this.audioCtx.currentTime;
+        if (p > PEAK_THRESHOLD) {
+          if (this.aboveSinceTime === 0) this.aboveSinceTime = t;
+          if (!this._fired && t - this.aboveSinceTime >= sustainSec) {
             this._fired = true;
             this.onCue && this.onCue();
           }
+        } else {
+          this.aboveSinceTime = 0;
         }
-        this.aboveThreshold = above;
         i += winSamples;
       }
       buffered = cat.subarray(i);
