@@ -1,6 +1,5 @@
-// FSK encoder. Builds an AudioBuffer from a sequence of frame bytes.
-// Each byte = 2 nibbles = 2 symbols. Each symbol = one tone from the 16-tone alphabet.
-// Frames are separated by gap silence and prefixed with a preamble pattern.
+// Multi-tone FSK encoder. One symbol slot carries one byte, encoded as 4
+// simultaneous tones — one from each of 4 sub-bands (4-FSK per band).
 
 import { getProfile } from "./profiles.js";
 import { buildFrames, sessionStringTo16 } from "./framing.js";
@@ -10,16 +9,28 @@ function applyEnvelope(samples, sampleRate, envelopeKind) {
   const fadeSamples = Math.min(samples.length / 4, Math.floor((fadeMs / 1000) * sampleRate));
   for (let i = 0; i < fadeSamples; i++) {
     const t = i / fadeSamples;
-    const w = 0.5 * (1 - Math.cos(Math.PI * t)); // Hann
+    const w = 0.5 * (1 - Math.cos(Math.PI * t));
     samples[i] *= w;
     samples[samples.length - 1 - i] *= w;
   }
 }
 
-function fillTone(samples, offset, count, freq, sampleRate, amplitude, envelope) {
+function fillSingleTone(samples, offset, count, freq, sampleRate, amplitude, envelope) {
   const buf = new Float32Array(count);
   const omega = 2 * Math.PI * freq / sampleRate;
   for (let i = 0; i < count; i++) buf[i] = amplitude * Math.sin(omega * i);
+  applyEnvelope(buf, sampleRate, envelope);
+  samples.set(buf, offset);
+}
+
+function fillMultiTone(samples, offset, count, freqs, sampleRate, perToneAmp, envelope) {
+  const buf = new Float32Array(count);
+  const omegas = freqs.map((f) => 2 * Math.PI * f / sampleRate);
+  for (let i = 0; i < count; i++) {
+    let s = 0;
+    for (let j = 0; j < omegas.length; j++) s += perToneAmp * Math.sin(omegas[j] * i);
+    buf[i] = s;
+  }
   applyEnvelope(buf, sampleRate, envelope);
   samples.set(buf, offset);
 }
@@ -31,30 +42,36 @@ export function encodeFramesToAudioBuffer(audioCtx, frames, profile) {
   const syncGapSamples = Math.floor(profile.syncGapMs / 1000 * sr);
   const interFrameGap = Math.floor(profile.symbolMs * 4 / 1000 * sr);
 
-  // Each frame: sync tone + silence + (frameBytes.length * 2) symbols + inter-frame gap
+  // 1 symbol per byte (was 2 nibbles). Per-frame length:
+  // bytes: 7 header + payload + 2 crc = (9 + payload) bytes
   let totalSamples = 0;
   for (const f of frames) {
-    totalSamples += syncSamples + syncGapSamples + f.length * 2 * symbolSamples + interFrameGap;
+    totalSamples += syncSamples + syncGapSamples + f.length * symbolSamples + interFrameGap;
   }
 
   const buffer = audioCtx.createBuffer(1, Math.max(1, totalSamples), sr);
   const out = buffer.getChannelData(0);
 
   let off = 0;
-  const amp = 0.6;
+  const syncAmp = 0.55;
+  const perTone = profile.perToneAmplitude || 0.22;
   for (const f of frames) {
-    // Sustained sync tone — the receiver locks the symbol grid on its trailing edge.
-    fillTone(out, off, syncSamples, profile.syncHz, sr, amp, profile.envelope);
+    fillSingleTone(out, off, syncSamples, profile.syncHz, sr, syncAmp, profile.envelope);
     off += syncSamples;
-    // Silence gap — clean falling edge for sync detection, no symbol grid pollution.
-    off += syncGapSamples;
-    // Data symbols, two per byte (high nibble first).
+    off += syncGapSamples; // silence
     for (let i = 0; i < f.length; i++) {
-      const hi = (f[i] >> 4) & 0x0f;
-      const lo = f[i] & 0x0f;
-      fillTone(out, off, symbolSamples, profile.tones[hi], sr, amp, profile.envelope);
-      off += symbolSamples;
-      fillTone(out, off, symbolSamples, profile.tones[lo], sr, amp, profile.envelope);
+      const b = f[i];
+      const i0 = (b >> 6) & 0x3;
+      const i1 = (b >> 4) & 0x3;
+      const i2 = (b >> 2) & 0x3;
+      const i3 = b & 0x3;
+      const freqs = [
+        profile.bands[0][i0],
+        profile.bands[1][i1],
+        profile.bands[2][i2],
+        profile.bands[3][i3],
+      ];
+      fillMultiTone(out, off, symbolSamples, freqs, sr, perTone, profile.envelope);
       off += symbolSamples;
     }
     off += interFrameGap;
@@ -113,7 +130,6 @@ export class ChirpPlayer {
         if (this.onDone) this.onDone(true);
         return;
       }
-      // small inter-cycle pause
       setTimeout(() => this._playOne(), 250);
     };
     this.source = src;

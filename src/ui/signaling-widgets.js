@@ -67,11 +67,14 @@ export function presentPayload(payloadBytes, opts = {}) {
       el("option", { value: "modem-v1" }, "modem"),
       el("option", { value: "diagnostic-v1" }, "diagnostic (slow)"),
     );
-    const repeatInput = el("input", { type: "number", value: 6, min: 1, max: 30, style: { width: "80px" } });
+    const repeatInput = el("input", { type: "number", value: 4, min: 1, max: 30, style: { width: "80px" } });
     const playBtn = el("button", { class: "primary" }, "Play chirp");
     const stopBtn = el("button", {}, "Stop");
-    const lengthRow = el("div", { class: "kv" }, "");
+    const planRow = el("div", { class: "kv" }, "");
+    const progressBar = el("div", { class: "progress" }, el("div"));
+    const progressLabel = el("div", { class: "kv" }, "");
     const cycleRow = el("div", { class: "kv" }, "");
+    const frameGrid = el("div", { class: "frame-list" });
     chirpStatus = el("div", { class: "kv" }, "Ready.");
 
     body.appendChild(el("div", { class: "row" },
@@ -79,12 +82,66 @@ export function presentPayload(payloadBytes, opts = {}) {
       el("div", { class: "col" }, el("label", {}, "Repeats"), repeatInput),
     ));
     body.appendChild(el("div", { class: "btn-group", style: { marginTop: "8px" } }, playBtn, stopBtn));
-    body.appendChild(lengthRow);
+    body.appendChild(planRow);
+    body.appendChild(progressBar);
+    body.appendChild(progressLabel);
     body.appendChild(cycleRow);
+    body.appendChild(frameGrid);
     body.appendChild(chirpStatus);
     body.appendChild(el("p", { class: "hint", style: { marginTop: "8px" } },
-      `Sending ${payloadBytes.length} packed bytes. Hold the device speaker near the other device's microphone.`
+      `Sending ${payloadBytes.length} bytes. Hold the device speaker near the other device's microphone. Each cycle plays the full payload; the receiver only needs each frame to land cleanly once across all cycles.`
     ));
+
+    function fmtTime(s) {
+      const m = Math.floor(s / 60);
+      const r = Math.round(s % 60);
+      return m > 0 ? `${m}m ${r}s` : `${r}s`;
+    }
+
+    function renderPlanFrameGrid(frameCount) {
+      while (frameGrid.firstChild) frameGrid.removeChild(frameGrid.firstChild);
+      for (let i = 1; i <= frameCount; i++) {
+        const c = el("div", { class: "frame-cell" }, String(i));
+        frameGrid.appendChild(c);
+      }
+    }
+
+    function updatePlan() {
+      try {
+        const tempCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const built = buildChirpForPayload(tempCtx, payloadBytes, sessionId, profileSel.value);
+        const cycleSec = built.buffer.duration;
+        const repeats = parseInt(repeatInput.value, 10) || 1;
+        const totalSec = cycleSec * repeats + (repeats - 1) * 0.25;
+        planRow.textContent =
+          `${built.frames.length} frame${built.frames.length === 1 ? "" : "s"} · ${cycleSec.toFixed(1)}s/cycle · ` +
+          `${repeats} cycle${repeats === 1 ? "" : "s"} = ~${fmtTime(totalSec)} total`;
+        renderPlanFrameGrid(built.frames.length);
+        try { tempCtx.close(); } catch {}
+      } catch (e) {
+        planRow.textContent = "(plan error: " + e.message + ")";
+      }
+    }
+    profileSel.addEventListener("change", updatePlan);
+    repeatInput.addEventListener("input", updatePlan);
+    updatePlan();
+
+    let playStartedAt = 0;
+    let cycleSec = 0;
+    let totalSec = 0;
+    let raf = 0;
+    function startTimer() {
+      cancelAnimationFrame(raf);
+      const tick = () => {
+        if (!chirpPlayer || !chirpPlayer.playing) return;
+        const elapsed = (performance.now() - playStartedAt) / 1000;
+        const pct = Math.min(100, (elapsed / totalSec) * 100);
+        progressBar.firstElementChild.style.width = pct.toFixed(1) + "%";
+        progressLabel.textContent = `${fmtTime(elapsed)} / ${fmtTime(totalSec)}  (${pct.toFixed(0)}%)`;
+        raf = requestAnimationFrame(tick);
+      };
+      raf = requestAnimationFrame(tick);
+    }
 
     playBtn.addEventListener("click", async () => {
       try {
@@ -95,18 +152,32 @@ export function presentPayload(payloadBytes, opts = {}) {
           return;
         }
         const built = buildChirpForPayload(audioCtx, payloadBytes, sessionId, profileSel.value);
-        lengthRow.textContent = `Frames: ${built.frames.length} · ${(built.buffer.duration).toFixed(1)}s per cycle · ${payloadBytes.length} bytes`;
+        renderPlanFrameGrid(built.frames.length);
+        cycleSec = built.buffer.duration;
+        const repeats = parseInt(repeatInput.value, 10) || 3;
+        totalSec = cycleSec * repeats + (repeats - 1) * 0.25;
+        progressBar.classList.remove("ok");
+        progressBar.firstElementChild.style.width = "0%";
         chirpPlayer = new ChirpPlayer(audioCtx);
-        chirpPlayer.play(built.buffer, parseInt(repeatInput.value, 10) || 3,
+        playStartedAt = performance.now();
+        chirpPlayer.play(built.buffer, repeats,
           (n, max) => { cycleRow.textContent = `Cycle ${n}/${max}`; },
-          (done) => { chirpStatus.textContent = done ? "Finished playing." : "Stopped."; }
+          (done) => {
+            cancelAnimationFrame(raf);
+            progressBar.firstElementChild.style.width = "100%";
+            if (done) progressBar.classList.add("ok");
+            chirpStatus.textContent = done ? "Finished playing." : "Stopped.";
+          }
         );
-        chirpStatus.textContent = "Playing...";
+        chirpStatus.textContent = "Playing… keep devices close.";
+        cycleRow.textContent = `Cycle 1/${repeats}`;
+        startTimer();
       } catch (e) {
         chirpStatus.textContent = "Audio error: " + e.message;
       }
     });
     stopBtn.addEventListener("click", () => {
+      cancelAnimationFrame(raf);
       if (chirpPlayer) chirpPlayer.stop();
     });
   }
@@ -214,14 +285,16 @@ export function capturePayload(onPayload, opts = {}) {
     const startBtn = el("button", { class: "primary" }, "Start listening");
     const stopBtn = el("button", {}, "Stop");
     const status = el("div", { class: "kv" }, "Idle.");
+    const progressLabel = el("div", { class: "kv" }, "");
     const frames = el("div", { class: "frame-list" });
     const meter = el("canvas", { class: "viz" });
     body.appendChild(el("div", { class: "row" }, el("div", { class: "col grow" }, el("label", {}, "Profile"), profileSel)));
     body.appendChild(el("div", { class: "btn-group", style: { marginTop: "8px" } }, startBtn, stopBtn));
     body.appendChild(meter);
     body.appendChild(status);
+    body.appendChild(progressLabel);
     body.appendChild(frames);
-    body.appendChild(el("p", { class: "hint" }, "Hold devices close. The chirp must remain audible. Background noise hurts decode."));
+    body.appendChild(el("p", { class: "hint" }, "Each red square is a missing frame; each green is locked in. Decode finishes when every cell is green. The receiver keeps every frame it ever decoded — frames missed in cycle 1 just need to land cleanly in any later cycle."));
 
     let levelRing = new Float32Array(120);
     let levelIdx = 0;
@@ -261,6 +334,7 @@ export function capturePayload(onPayload, opts = {}) {
         await decoder.start({
           onFrame: (info) => {
             status.textContent = `Frame ${info.seq}/${info.total} · have ${info.have}` + (info.missing.length ? ` · missing ${info.missing.join(",")}` : "");
+            progressLabel.textContent = `${info.have}/${info.total} frames decoded`;
             renderFrames(frames, info.have, info.total, info.missing);
             if (info.complete) status.textContent += " · complete";
           },

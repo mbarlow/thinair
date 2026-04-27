@@ -1,5 +1,5 @@
-// Audio profiles. v1 uses 16-FSK across audible band, with a sustained low-tone
-// preamble for sample-accurate sync.
+// Audio profiles. v3 uses 4 parallel sub-bands × 4-FSK each = 1 byte per
+// symbol slot. Sustained-tone preamble for sample-accurate sync.
 
 export const PROFILES = {
   "birdsong-v1": {
@@ -11,11 +11,19 @@ export const PROFILES = {
     payloadBytesPerFrame: 32,
     minHz: 1500,
     maxHz: 4500,
-    tones: logSpaced(1500, 4500, 16),
+    // 4 sub-bands, each 4-FSK (2 bits/band). Tones picked with ≥200 Hz gaps so
+    // a 60 ms Goertzel window at 48 kHz (~17 Hz bin) cleanly separates them.
+    bands: [
+      [1500, 1700, 1900, 2100],
+      [2300, 2500, 2700, 2900],
+      [3100, 3300, 3500, 3700],
+      [3900, 4100, 4300, 4500],
+    ],
     syncHz: 800,
     syncMs: 250,
     syncGapMs: 50,
     envelope: "soft",
+    perToneAmplitude: 0.22, // sum across 4 tones ~0.88, no clipping
   },
   "modem-v1": {
     name: "modem-v1",
@@ -26,11 +34,17 @@ export const PROFILES = {
     payloadBytesPerFrame: 32,
     minHz: 1200,
     maxHz: 3600,
-    tones: linSpaced(1200, 3600, 16),
+    bands: [
+      [1200, 1380, 1560, 1740],
+      [1920, 2100, 2280, 2460],
+      [2640, 2820, 3000, 3180],
+      [3360, 3540, 3720, 3900],
+    ],
     syncHz: 600,
     syncMs: 200,
     syncGapMs: 40,
     envelope: "hard",
+    perToneAmplitude: 0.22,
   },
   "diagnostic-v1": {
     name: "diagnostic-v1",
@@ -38,33 +52,22 @@ export const PROFILES = {
     symbolMs: 140,
     gapMs: 30,
     repeat: 2,
-    payloadBytesPerFrame: 8,
+    payloadBytesPerFrame: 16,
     minHz: 1500,
     maxHz: 4500,
-    tones: logSpaced(1500, 4500, 8).concat(logSpaced(1500, 4500, 16).slice(8)),
+    bands: [
+      [1500, 1750, 2000, 2250],
+      [2500, 2750, 3000, 3250],
+      [3500, 3750, 4000, 4250],
+      [4500, 4750, 5000, 5250],
+    ],
     syncHz: 800,
     syncMs: 400,
     syncGapMs: 100,
     envelope: "soft",
+    perToneAmplitude: 0.22,
   },
 };
-
-function logSpaced(lo, hi, n) {
-  const out = [];
-  const a = Math.log(lo);
-  const b = Math.log(hi);
-  for (let i = 0; i < n; i++) {
-    const t = i / (n - 1);
-    out.push(Math.round(Math.exp(a + (b - a) * t)));
-  }
-  return out;
-}
-
-function linSpaced(lo, hi, n) {
-  const out = [];
-  for (let i = 0; i < n; i++) out.push(Math.round(lo + (hi - lo) * i / (n - 1)));
-  return out;
-}
 
 export function getProfile(name) {
   return PROFILES[name] || PROFILES["birdsong-v1"];
