@@ -7,8 +7,9 @@
 import { el, clear, copyText, toast } from "./util.js";
 import { AnimatedQR } from "../qr/qr-generate.js";
 import { QRScanner } from "../qr/qr-scan.js";
-import { ChirpPlayer, buildChirpForPayload } from "../audio/chirp-encode.js";
+import { ChirpPlayer, buildChirpForPayload, buildPartialChirp } from "../audio/chirp-encode.js";
 import { ChirpDecoder } from "../audio/chirp-decode.js";
+import { buildNackPayload, buildAckPayload, parseControl } from "../audio/control.js";
 import { bytesToText, parsePayloadFromText, parsePayloadFromBytes } from "../webrtc/signaling.js";
 
 // PRESENT widget. payloadBytes is a Uint8Array.
@@ -67,9 +68,10 @@ export function presentPayload(payloadBytes, opts = {}) {
       el("option", { value: "modem-v1" }, "modem"),
       el("option", { value: "diagnostic-v1" }, "diagnostic (slow)"),
     );
-    const repeatInput = el("input", { type: "number", value: 4, min: 1, max: 30, style: { width: "80px" } });
+    const repeatInput = el("input", { type: "number", value: 1, min: 1, max: 30, style: { width: "80px" } });
     const playBtn = el("button", { class: "primary" }, "Play chirp");
     const stopBtn = el("button", {}, "Stop");
+    const listenBtn = el("button", {}, "🎙 Listen for retry");
     const planRow = el("div", { class: "kv" }, "");
     const progressBar = el("div", { class: "progress" }, el("div"));
     const progressLabel = el("div", { class: "kv" }, "");
@@ -77,11 +79,15 @@ export function presentPayload(payloadBytes, opts = {}) {
     const frameGrid = el("div", { class: "frame-list" });
     chirpStatus = el("div", { class: "kv" }, "Ready.");
 
+    let lastBuilt = null; // { frames, profile } from the last full-payload play, used for NACK replay
+    let retryDecoder = null;
+    let retryAttempts = 0;
+
     body.appendChild(el("div", { class: "row" },
       el("div", { class: "col grow" }, el("label", {}, "Profile"), profileSel),
       el("div", { class: "col" }, el("label", {}, "Repeats"), repeatInput),
     ));
-    body.appendChild(el("div", { class: "btn-group", style: { marginTop: "8px" } }, playBtn, stopBtn));
+    body.appendChild(el("div", { class: "btn-group", style: { marginTop: "8px" } }, playBtn, stopBtn, listenBtn));
     body.appendChild(planRow);
     body.appendChild(progressBar);
     body.appendChild(progressLabel);
@@ -89,7 +95,7 @@ export function presentPayload(payloadBytes, opts = {}) {
     body.appendChild(frameGrid);
     body.appendChild(chirpStatus);
     body.appendChild(el("p", { class: "hint", style: { marginTop: "8px" } },
-      `Sending ${payloadBytes.length} bytes. Hold the device speaker near the other device's microphone. Each cycle plays the full payload; the receiver only needs each frame to land cleanly once across all cycles.`
+      `Sending ${payloadBytes.length} bytes. Hold the device speaker near the other device's microphone. After the chirp finishes, tap "Listen for retry" — if the receiver missed any frames it will chirp back which ones, and only those will replay.`
     ));
 
     function fmtTime(s) {
@@ -151,10 +157,13 @@ export function presentPayload(payloadBytes, opts = {}) {
           chirpStatus.textContent = "Payload too large for chirp: " + payloadBytes.length + " bytes. Use QR.";
           return;
         }
+        if (retryDecoder) { retryDecoder.stop(); retryDecoder = null; }
         const built = buildChirpForPayload(audioCtx, payloadBytes, sessionId, profileSel.value);
+        lastBuilt = { frames: built.frames, profile: built.profile, profileName: profileSel.value };
+        retryAttempts = 0;
         renderPlanFrameGrid(built.frames.length);
         cycleSec = built.buffer.duration;
-        const repeats = parseInt(repeatInput.value, 10) || 3;
+        const repeats = parseInt(repeatInput.value, 10) || 1;
         totalSec = cycleSec * repeats + (repeats - 1) * 0.25;
         progressBar.classList.remove("ok");
         progressBar.firstElementChild.style.width = "0%";
@@ -166,7 +175,9 @@ export function presentPayload(payloadBytes, opts = {}) {
             cancelAnimationFrame(raf);
             progressBar.firstElementChild.style.width = "100%";
             if (done) progressBar.classList.add("ok");
-            chirpStatus.textContent = done ? "Finished playing." : "Stopped.";
+            chirpStatus.textContent = done
+              ? "Finished. Tap 'Listen for retry' to hear the receiver's response."
+              : "Stopped.";
           }
         );
         chirpStatus.textContent = "Playing… keep devices close.";
@@ -179,7 +190,69 @@ export function presentPayload(payloadBytes, opts = {}) {
     stopBtn.addEventListener("click", () => {
       cancelAnimationFrame(raf);
       if (chirpPlayer) chirpPlayer.stop();
+      if (retryDecoder) { retryDecoder.stop(); retryDecoder = null; }
     });
+
+    async function startRetryListen() {
+      if (!lastBuilt) {
+        chirpStatus.textContent = "Play the chirp first so the receiver has something to ack.";
+        return;
+      }
+      if (retryDecoder) { retryDecoder.stop(); retryDecoder = null; }
+      if (chirpPlayer) chirpPlayer.stop();
+      retryDecoder = new ChirpDecoder(lastBuilt.profileName);
+      chirpStatus.textContent = "Listening for retry chirp from receiver…";
+      try {
+        await retryDecoder.start({
+          onFrame: () => {},
+          onSignal: async (s) => {
+            if (s.kind === "complete") {
+              const ctrl = parseControl(s.payload);
+              if (!ctrl) {
+                chirpStatus.textContent = "Heard a chirp but it wasn't a control message — ignoring.";
+                return;
+              }
+              if (ctrl.kind === "ack") {
+                chirpStatus.textContent = "✅ Receiver confirmed all frames received.";
+                progressBar.classList.add("ok");
+                if (retryDecoder) { retryDecoder.stop(); retryDecoder = null; }
+                return;
+              }
+              // NACK
+              if (!ctrl.missing.length) {
+                chirpStatus.textContent = "Receiver sent NACK with no missing frames — treating as ACK.";
+                if (retryDecoder) { retryDecoder.stop(); retryDecoder = null; }
+                return;
+              }
+              if (retryDecoder) { retryDecoder.stop(); retryDecoder = null; }
+              retryAttempts++;
+              chirpStatus.textContent = `Receiver missing frames ${ctrl.missing.join(", ")}. Replaying… (attempt ${retryAttempts})`;
+              if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+              if (audioCtx.state === "suspended") await audioCtx.resume();
+              const partial = buildPartialChirp(audioCtx, lastBuilt.frames, ctrl.missing, lastBuilt.profileName);
+              if (!partial) {
+                chirpStatus.textContent = "No frames matched the NACK list.";
+                return;
+              }
+              chirpPlayer = new ChirpPlayer(audioCtx);
+              chirpPlayer.play(partial.buffer, 1,
+                () => {},
+                () => {
+                  chirpStatus.textContent = "Replay finished. Listening for next response…";
+                  startRetryListen();
+                }
+              );
+            } else if (s.kind === "bad-frame") {
+              chirpStatus.textContent = "Heard a chirp but CRC failed — listening again.";
+            }
+          },
+          onLevel: () => {},
+        });
+      } catch (e) {
+        chirpStatus.textContent = "Mic error: " + e.message;
+      }
+    }
+    listenBtn.addEventListener("click", startRetryListen);
   }
 
   function renderTextMode() {
@@ -284,20 +357,26 @@ export function capturePayload(onPayload, opts = {}) {
     );
     const startBtn = el("button", { class: "primary" }, "Start listening");
     const stopBtn = el("button", {}, "Stop");
+    const sendNackBtn = el("button", {}, "🔊 Send retry request");
+    const sendAckBtn = el("button", {}, "🔊 Send ACK (complete)");
+    sendNackBtn.disabled = true;
+    sendAckBtn.disabled = true;
     const status = el("div", { class: "kv" }, "Idle.");
     const progressLabel = el("div", { class: "kv" }, "");
     const frames = el("div", { class: "frame-list" });
     const meter = el("canvas", { class: "viz" });
     body.appendChild(el("div", { class: "row" }, el("div", { class: "col grow" }, el("label", {}, "Profile"), profileSel)));
-    body.appendChild(el("div", { class: "btn-group", style: { marginTop: "8px" } }, startBtn, stopBtn));
+    body.appendChild(el("div", { class: "btn-group", style: { marginTop: "8px" } }, startBtn, stopBtn, sendNackBtn, sendAckBtn));
     body.appendChild(meter);
     body.appendChild(status);
     body.appendChild(progressLabel);
     body.appendChild(frames);
-    body.appendChild(el("p", { class: "hint" }, "Each red square is a missing frame; each green is locked in. Decode finishes when every cell is green. The receiver keeps every frame it ever decoded — frames missed in cycle 1 just need to land cleanly in any later cycle."));
+    body.appendChild(el("p", { class: "hint" }, "Each red square is a missing frame; each green is locked in. Decode finishes when every cell is green. After the sender's chirp ends, tap 'Send retry request' if some cells are still red — only the missing frames will be replayed. Tap 'Send ACK' when complete to tell the sender to stop."));
 
     let levelRing = new Float32Array(120);
     let levelIdx = 0;
+    let currentTotal = 0;
+    let currentMissing = [];
     function drawMeter() {
       const ctx = meter.getContext("2d");
       const w = meter.width = meter.clientWidth;
@@ -336,6 +415,10 @@ export function capturePayload(onPayload, opts = {}) {
             status.textContent = `Frame ${info.seq}/${info.total} · have ${info.have}` + (info.missing.length ? ` · missing ${info.missing.join(",")}` : "");
             progressLabel.textContent = `${info.have}/${info.total} frames decoded`;
             renderFrames(frames, info.have, info.total, info.missing);
+            currentTotal = info.total;
+            currentMissing = info.missing.slice();
+            sendNackBtn.disabled = !info.total || info.complete;
+            sendAckBtn.disabled = !info.complete;
             if (info.complete) status.textContent += " · complete";
           },
           onSignal: (s) => {
@@ -364,6 +447,71 @@ export function capturePayload(onPayload, opts = {}) {
       }
     });
     stopBtn.addEventListener("click", () => { drawing = false; if (decoder) decoder.stop(); });
+
+    async function chirpControl(controlPayload, label) {
+      // Pause the listening decoder so it doesn't pick up its own speaker output.
+      const wasRunning = !!(decoder && decoder.running);
+      if (decoder) decoder.stop();
+      const sendCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (sendCtx.state === "suspended") await sendCtx.resume();
+      const built = buildChirpForPayload(sendCtx, controlPayload, "thinair-ctrl", profileSel.value);
+      status.textContent = `Chirping ${label}… (${built.buffer.duration.toFixed(1)}s)`;
+      const player = new ChirpPlayer(sendCtx);
+      await new Promise((resolve) => player.play(built.buffer, 1, () => {}, () => resolve()));
+      try { sendCtx.close(); } catch {}
+      status.textContent = label + " sent.";
+      if (wasRunning) {
+        decoder = new ChirpDecoder(profileSel.value);
+        await decoder.start({
+          onFrame: (info) => {
+            progressLabel.textContent = `${info.have}/${info.total} frames decoded`;
+            renderFrames(frames, info.have, info.total, info.missing);
+            currentTotal = info.total;
+            currentMissing = info.missing.slice();
+            sendNackBtn.disabled = !info.total || info.complete;
+            sendAckBtn.disabled = !info.complete;
+            if (info.complete) status.textContent = "Listening — payload complete.";
+          },
+          onSignal: (s) => {
+            if (s.kind === "complete") {
+              status.textContent = `Decoded ${s.payload.length} bytes`;
+              deliverFromBytes(s.payload);
+            } else if (s.kind === "sync-rising") {
+              status.textContent = "Sync rising…";
+            } else if (s.kind === "sync-locked") {
+              status.textContent = "Sync locked. Reading frame…";
+            } else if (s.kind === "bad-frame") {
+              status.textContent = "Bad frame (CRC failed) — resyncing…";
+            } else if (s.kind === "abort") {
+              status.textContent = "Aborted (" + s.reason + "), resyncing…";
+            }
+          },
+          onLevel: (lvl) => { levelRing[levelIdx] = lvl; levelIdx = (levelIdx + 1) % levelRing.length; },
+        });
+      }
+    }
+
+    sendNackBtn.addEventListener("click", async () => {
+      if (!currentTotal) return;
+      sendNackBtn.disabled = true;
+      try {
+        const payload = buildNackPayload(currentTotal, currentMissing);
+        await chirpControl(payload, `NACK (${currentMissing.length} missing)`);
+      } catch (e) {
+        status.textContent = "NACK error: " + e.message;
+      } finally {
+        sendNackBtn.disabled = !currentTotal || currentMissing.length === 0;
+      }
+    });
+    sendAckBtn.addEventListener("click", async () => {
+      sendAckBtn.disabled = true;
+      try {
+        const payload = buildAckPayload(currentTotal);
+        await chirpControl(payload, "ACK");
+      } catch (e) {
+        status.textContent = "ACK error: " + e.message;
+      }
+    });
   }
 
   function renderFrames(host, have, total, missing) {

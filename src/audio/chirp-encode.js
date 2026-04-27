@@ -121,6 +121,22 @@ export function buildChirpForPayload(audioCtx, payloadBytes, sessionStr, profile
   return { buffer, profile, frames };
 }
 
+// Build an AudioBuffer that only plays the requested 1-based frame numbers
+// from a previously-built frame array. Used by NACK retransmission: the
+// receiver tells the sender which frames are missing, the sender replays
+// just those (each frame still carries its real seq/total in its header).
+export function buildPartialChirp(audioCtx, allFrames, missingIndices, profileName) {
+  const profile = getProfile(profileName);
+  const subset = [];
+  for (const idx of missingIndices) {
+    const f = allFrames[idx - 1];
+    if (f) subset.push(f);
+  }
+  if (!subset.length) return null;
+  const buffer = encodeFramesToAudioBuffer(audioCtx, subset, profile);
+  return { buffer, profile, frames: subset };
+}
+
 export class ChirpPlayer {
   constructor(audioCtx) {
     this.ctx = audioCtx;
