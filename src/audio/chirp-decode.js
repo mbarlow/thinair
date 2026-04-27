@@ -1,9 +1,14 @@
-// Multi-band FSK decoder. Tracks energy at the sync tone, locks the symbol
-// grid on the falling edge, then for each symbol reads 4 simultaneous tones —
-// one per sub-band, 4-FSK each. Combines into 1 byte per symbol slot.
+// Multi-band FSK decoder with chirp-sweep matched-filter sync.
+//
+// Sync: a streaming I/Q correlation against the encoder's linear-FM sweep
+// template. Peak of |corr| gives sample-accurate end-of-sweep alignment;
+// symbols start at peak + sweepGapSamples on a stable grid.
+//
+// Data: each symbol slot carries one byte split across 4 sub-bands × 4-FSK.
 
 import { getProfile } from "./profiles.js";
 import { parseFrame, FrameAssembler, MAGIC } from "./framing.js";
+import { makeSweepTemplates } from "./chirp-encode.js";
 
 function goertzel(samples, off, len, k) {
   const omega = 2 * Math.PI * k;
@@ -19,9 +24,20 @@ function goertzel(samples, off, len, k) {
 
 const STATE = {
   SEARCH: "search",
-  IN_SYNC: "in-sync",
+  PEAK_RISING: "peak-rising",
   LOCKED: "locked",
 };
+
+// Decimation factor for streaming correlation: step both input and template
+// by this many samples. Saves CPU; precision = D samples ≈ 167 µs at 48 kHz,
+// negligible vs a 60 ms symbol.
+const CORR_DECIMATE = 8;
+// Minimum correlation magnitude to consider a candidate sync peak. Calibrated
+// against the I/Q template normalization: a perfectly aligned 0.55-amplitude
+// sweep produces a peak around 2.8; data-symbol cross-correlation tops out
+// near 0.2; quiet-room noise hovers below 0.05. 0.5 puts a clean separator
+// between "real sweep" and "anything else."
+const MIN_PEAK = 0.5;
 
 export class ChirpDecoder {
   constructor(profileName, opts = {}) {
@@ -38,22 +54,28 @@ export class ChirpDecoder {
     this.totalSamplesProcessed = 0;
     this.sampleRate = 0;
     this.symbolSamples = 0;
-    this.syncWindowSamples = 0;
-    this.searchHopSamples = 0;
-    this.bandKs = null;       // [[k,k,k,k] x 4]
-    this.syncK = 0;
-    this.syncGapSamples = 0;
-    this.bandLowK = 0;
-    this.bandHighK = 0;
+    this.sweepSamples = 0;
+    this.sweepGapSamples = 0;
+    this.bandKs = null;
+    this.searchClock = 0;
+    this.searchHopSamples = CORR_DECIMATE;
+    // Matched filter
+    this.tmplI = null;
+    this.tmplQ = null;
+    this.tmplDecLen = 0; // length of decimated template
+    this.corrNoiseEwma = 1e-9;
+    this.corrPrev = 0;
+    this.peakCorr = 0;
+    this.peakAt = 0;
+    this.peakDecayCount = 0;
+    // Frame state
     this.state = STATE.SEARCH;
     this.frameBytes = [];
     this.frameTargetBytes = 0;
     this.symbolClock = 0;
-    this.searchClock = 0;
     this.assembler = new FrameAssembler();
-    this.noiseFloor = 1e-9;
-    this.peakSync = 0;
     this.lastLevel = 0;
+    this.lastCorr = 0;
     this.onFrame = null;
     this.onSignal = null;
     this.onLevel = null;
@@ -98,28 +120,40 @@ export class ChirpDecoder {
     const sr = this.sampleRate;
     const p = this.profile;
     this.symbolSamples = Math.floor(p.symbolMs / 1000 * sr);
-    this.syncWindowSamples = Math.max(256, Math.floor(0.030 * sr));
-    this.searchHopSamples = Math.max(64, Math.floor(this.syncWindowSamples / 4));
-    this.syncGapSamples = Math.floor(p.syncGapMs / 1000 * sr);
+    this.sweepSamples = Math.floor(p.sweepMs / 1000 * sr);
+    this.sweepGapSamples = Math.floor(p.sweepGapMs / 1000 * sr);
     this.bandKs = p.bands.map((band) => band.map((f) => f / sr));
-    this.syncK = p.syncHz / sr;
-    this.bandLowK = p.minHz / sr;
-    this.bandHighK = p.maxHz / sr;
+
+    // Pre-compute decimated I/Q templates.
+    const fullTpl = makeSweepTemplates(this.sweepSamples, p.sweepStartHz, p.sweepEndHz, sr);
+    const decLen = Math.floor(this.sweepSamples / CORR_DECIMATE);
+    const ti = new Float32Array(decLen);
+    const tq = new Float32Array(decLen);
+    for (let i = 0; i < decLen; i++) {
+      ti[i] = fullTpl.i[i * CORR_DECIMATE];
+      tq[i] = fullTpl.q[i * CORR_DECIMATE];
+    }
+    this.tmplI = ti;
+    this.tmplQ = tq;
+    this.tmplDecLen = decLen;
+
     const maxFrameBytes = (9 + 255);
     const maxFrameSamples = maxFrameBytes * this.symbolSamples;
-    const minSyncSamples = Math.floor(p.syncMs / 1000 * sr) + this.syncGapSamples;
-    const ringSize = Math.max(sr * 2, maxFrameSamples + minSyncSamples + sr);
+    const ringSize = Math.max(sr * 2, this.sweepSamples + maxFrameSamples + this.sweepGapSamples + sr);
     this.buf = new Float32Array(ringSize);
     this.bufWritePos = 0;
     this.bufFilled = 0;
     this.totalSamplesProcessed = 0;
-    this.searchClock = 0;
+    this.searchClock = this.sweepSamples; // need at least sweepSamples buffered
     this.symbolClock = 0;
     this.state = STATE.SEARCH;
     this.frameBytes = [];
     this.frameTargetBytes = 0;
-    this.peakSync = 0;
-    this.noiseFloor = 1e-9;
+    this.peakCorr = 0;
+    this.peakAt = 0;
+    this.peakDecayCount = 0;
+    this.corrNoiseEwma = 1e-9;
+    this.corrPrev = 0;
   }
 
   stop() {
@@ -142,7 +176,9 @@ export class ChirpDecoder {
     this.state = STATE.SEARCH;
     this.frameBytes = [];
     this.frameTargetBytes = 0;
-    this.peakSync = 0;
+    this.peakCorr = 0;
+    this.peakDecayCount = 0;
+    this.corrPrev = 0;
   }
 
   _onSamples(input) {
@@ -182,8 +218,20 @@ export class ChirpDecoder {
     return out;
   }
 
-  // Decode one byte from a sample buffer: pick the strongest tone in each of
-  // the 4 sub-bands (2 bits each), pack into a byte (band 0 = bits 7-6).
+  // Magnitude of the I/Q matched-filter correlation between the sweep template
+  // and the input window ending at endAbs.
+  _correlateSweep(endAbs) {
+    const w = this._readWindow(endAbs, this.sweepSamples);
+    if (!w) return 0;
+    let r = 0, im = 0;
+    for (let i = 0; i < this.tmplDecLen; i++) {
+      const x = w[i * CORR_DECIMATE];
+      r += x * this.tmplI[i];
+      im += x * this.tmplQ[i];
+    }
+    return Math.sqrt(r * r + im * im);
+  }
+
   _readByte(buf, off, len) {
     let byte = 0;
     let totalPow = 0;
@@ -203,38 +251,47 @@ export class ChirpDecoder {
 
   _process() {
     while (true) {
-      if (this.state === STATE.SEARCH || this.state === STATE.IN_SYNC) {
-        const wEnd = this.searchClock + this.syncWindowSamples;
-        if (this.totalSamplesProcessed < wEnd) return;
-        const w = this._readWindow(wEnd, this.syncWindowSamples);
-        if (!w) { this.searchClock += this.searchHopSamples; continue; }
-        const syncPow = goertzel(w, 0, w.length, this.syncK);
-        const dataPow = goertzel(w, 0, w.length, (this.bandLowK + this.bandHighK) / 2);
+      if (this.state === STATE.SEARCH || this.state === STATE.PEAK_RISING) {
+        if (this.totalSamplesProcessed < this.searchClock) return;
+        const corr = this._correlateSweep(this.searchClock);
+        this.lastCorr = corr;
 
         if (this.state === STATE.SEARCH) {
-          if (syncPow < this.noiseFloor * 4 || this.noiseFloor < 1e-12) {
-            this.noiseFloor = this.noiseFloor * 0.95 + syncPow * 0.05;
+          // Update background noise estimate when the value looks like noise
+          // (i.e. well below the floor). Avoids polluting it with sweep peaks.
+          if (corr < MIN_PEAK) {
+            this.corrNoiseEwma = this.corrNoiseEwma * 0.98 + corr * 0.02;
           }
-          const threshHigh = Math.max(this.noiseFloor * 30, 1e-6);
-          if (syncPow > threshHigh && syncPow > dataPow * 1.5) {
-            this.state = STATE.IN_SYNC;
-            this.peakSync = syncPow;
-            if (this.onSignal) this.onSignal({ kind: "sync-rising", energy: syncPow });
+          const thresh = Math.max(this.corrNoiseEwma * 8, MIN_PEAK);
+          if (corr > thresh && corr > this.corrPrev) {
+            this.peakCorr = corr;
+            this.peakAt = this.searchClock;
+            this.peakDecayCount = 0;
+            this.state = STATE.PEAK_RISING;
+            if (this.onSignal) this.onSignal({ kind: "sync-rising", energy: corr });
+          }
+          this.corrPrev = corr;
+          this.searchClock += this.searchHopSamples;
+        } else { // PEAK_RISING
+          if (corr > this.peakCorr) {
+            this.peakCorr = corr;
+            this.peakAt = this.searchClock;
+            this.peakDecayCount = 0;
+          } else {
+            this.peakDecayCount++;
+            // After several decreasing samples we're confident the peak passed.
+            if (this.peakDecayCount > 6) {
+              this.symbolClock = this.peakAt + this.sweepGapSamples;
+              this.state = STATE.LOCKED;
+              this.frameBytes = [];
+              this.frameTargetBytes = 0;
+              this.searchClock = this.symbolClock;
+              this.corrPrev = 0;
+              if (this.onSignal) this.onSignal({ kind: "sync-locked", peak: this.peakCorr });
+              continue;
+            }
           }
           this.searchClock += this.searchHopSamples;
-        } else if (this.state === STATE.IN_SYNC) {
-          if (syncPow > this.peakSync) this.peakSync = syncPow;
-          if (syncPow < this.peakSync * 0.15 || syncPow < this.noiseFloor * 8) {
-            const syncEndApprox = wEnd - this.syncWindowSamples;
-            this.symbolClock = syncEndApprox + this.syncGapSamples;
-            this.state = STATE.LOCKED;
-            this.frameBytes = [];
-            this.frameTargetBytes = 0;
-            this.searchClock = this.symbolClock;
-            if (this.onSignal) this.onSignal({ kind: "sync-locked" });
-          } else {
-            this.searchClock += this.searchHopSamples;
-          }
         }
       } else if (this.state === STATE.LOCKED) {
         const symStart = this.symbolClock;
@@ -255,7 +312,6 @@ export class ChirpDecoder {
         this.frameBytes.push(byte);
         this.symbolClock = symEnd;
 
-        // 7 header bytes (1 symbol each) → check magic + read length.
         if (this.frameTargetBytes === 0 && this.frameBytes.length >= 7) {
           if (this.frameBytes[0] !== MAGIC) {
             this._abort("bad-magic");
@@ -293,7 +349,9 @@ export class ChirpDecoder {
           this.state = STATE.SEARCH;
           this.frameBytes = [];
           this.frameTargetBytes = 0;
-          this.peakSync = 0;
+          this.peakCorr = 0;
+          this.peakDecayCount = 0;
+          this.corrPrev = 0;
           this.searchClock = this.symbolClock;
         }
       }
@@ -305,7 +363,9 @@ export class ChirpDecoder {
     this.state = STATE.SEARCH;
     this.frameBytes = [];
     this.frameTargetBytes = 0;
-    this.peakSync = 0;
+    this.peakCorr = 0;
+    this.peakDecayCount = 0;
+    this.corrPrev = 0;
     this.searchClock = this.symbolClock;
   }
 }

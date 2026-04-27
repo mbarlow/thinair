@@ -23,6 +23,43 @@ function fillSingleTone(samples, offset, count, freq, sampleRate, amplitude, env
   samples.set(buf, offset);
 }
 
+// Linear-FM sweep from f0 to f1 over `count` samples. Used as the preamble.
+// The receiver runs an I/Q matched filter against an identical template,
+// giving sample-accurate symbol-grid alignment.
+export function fillChirpSweep(samples, offset, count, f0, f1, sampleRate, amplitude, envelope) {
+  const buf = new Float32Array(count);
+  let phase = 0;
+  for (let i = 0; i < count; i++) {
+    const t = i / count;
+    const f = f0 + (f1 - f0) * t;
+    phase += 2 * Math.PI * f / sampleRate;
+    buf[i] = amplitude * Math.sin(phase);
+  }
+  applyEnvelope(buf, sampleRate, envelope);
+  samples.set(buf, offset);
+}
+
+// Generate the I and Q (cos/sin) reference templates the decoder uses for
+// matched-filter correlation. Identical phase trajectory to fillChirpSweep.
+export function makeSweepTemplates(count, f0, f1, sampleRate) {
+  const i = new Float32Array(count);
+  const q = new Float32Array(count);
+  let phase = 0;
+  for (let n = 0; n < count; n++) {
+    const t = n / count;
+    const f = f0 + (f1 - f0) * t;
+    phase += 2 * Math.PI * f / sampleRate;
+    i[n] = Math.cos(phase);
+    q[n] = Math.sin(phase);
+  }
+  // Normalize energy.
+  let e = 0;
+  for (let n = 0; n < count; n++) e += i[n] * i[n] + q[n] * q[n];
+  const k = 1 / Math.sqrt(e);
+  for (let n = 0; n < count; n++) { i[n] *= k; q[n] *= k; }
+  return { i, q };
+}
+
 function fillMultiTone(samples, offset, count, freqs, sampleRate, perToneAmp, envelope) {
   const buf = new Float32Array(count);
   const omegas = freqs.map((f) => 2 * Math.PI * f / sampleRate);
@@ -38,27 +75,25 @@ function fillMultiTone(samples, offset, count, freqs, sampleRate, perToneAmp, en
 export function encodeFramesToAudioBuffer(audioCtx, frames, profile) {
   const sr = audioCtx.sampleRate;
   const symbolSamples = Math.floor(profile.symbolMs / 1000 * sr);
-  const syncSamples = Math.floor(profile.syncMs / 1000 * sr);
-  const syncGapSamples = Math.floor(profile.syncGapMs / 1000 * sr);
+  const sweepSamples = Math.floor(profile.sweepMs / 1000 * sr);
+  const sweepGapSamples = Math.floor(profile.sweepGapMs / 1000 * sr);
   const interFrameGap = Math.floor(profile.symbolMs * 4 / 1000 * sr);
 
-  // 1 symbol per byte (was 2 nibbles). Per-frame length:
-  // bytes: 7 header + payload + 2 crc = (9 + payload) bytes
   let totalSamples = 0;
   for (const f of frames) {
-    totalSamples += syncSamples + syncGapSamples + f.length * symbolSamples + interFrameGap;
+    totalSamples += sweepSamples + sweepGapSamples + f.length * symbolSamples + interFrameGap;
   }
 
   const buffer = audioCtx.createBuffer(1, Math.max(1, totalSamples), sr);
   const out = buffer.getChannelData(0);
 
   let off = 0;
-  const syncAmp = 0.55;
+  const sweepAmp = 0.55;
   const perTone = profile.perToneAmplitude || 0.22;
   for (const f of frames) {
-    fillSingleTone(out, off, syncSamples, profile.syncHz, sr, syncAmp, profile.envelope);
-    off += syncSamples;
-    off += syncGapSamples; // silence
+    fillChirpSweep(out, off, sweepSamples, profile.sweepStartHz, profile.sweepEndHz, sr, sweepAmp, profile.envelope);
+    off += sweepSamples;
+    off += sweepGapSamples; // silence between preamble and data
     for (let i = 0; i < f.length; i++) {
       const b = f[i];
       const i0 = (b >> 6) & 0x3;
